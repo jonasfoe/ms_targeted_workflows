@@ -1,0 +1,25 @@
+Type: MS Targeted Workflows
+Description: MS Targeted Workflows
+Authors@R: person("Jonas D.", "Förster", email = "jonasfoerster@gmail.com", role = c("aut", "cre"))
+License: Attribution 4.0 International (CC BY 4.0) | file LICENSE
+Depends:
+    renv,
+    conflicted,
+    ggpp,
+    grid,
+    here,
+    IsoSpecR,
+    JuliaCall,
+    MsRawAccess,
+    MSTargetedWorkflows,
+    patchwork,
+    quarto,
+    ragg,
+    markdown,
+    rmarkdown,
+    scales,
+    svglite,
+    tictools,
+    tidyverse,
+    yaml,
+    fs

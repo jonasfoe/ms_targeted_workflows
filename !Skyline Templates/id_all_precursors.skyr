@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<views>
+  <view name="id_all_precursors" rowsource="pwiz.Skyline.Model.Databinding.Entities.Precursor" sublist="Results!*" uimode="proteomic">
+    <column name="Results!*.Value.PeptideResult.ResultFile.FileName" />
+    <column name="Results!*.Value.PeptideResult.ResultFile.Replicate.Name" />
+    <column name="Results!*.Value.PeptideResult.ResultFile.AcquiredTime" />
+    <column name="Peptide.Protein.Name" />
+    <column name="Peptide.Sequence" />
+    <column name="Peptide.ModifiedSequence.FullNames" />
+    <column name="Peptide.ModifiedSequence.ThreeLetterCodes" />
+    <column name="ModifiedSequence.FullNames" />
+    <column name="ModifiedSequence.ThreeLetterCodes" />
+    <column name="IsotopeLabelType" />
+    <column name="Mz" />
+    <column name="Charge" />
+    <column name="IonFormula" />
+    <column name="Results!*.Value.BestRetentionTime" />
+    <column name="Results!*.Value.MinStartTime" />
+    <column name="Results!*.Value.MaxEndTime" />
+    <column name="Peptide.PredictedRetentionTime" />
+    <column name="Results!*.Value.TotalAreaMs1" />
+    <column name="Results!*.Value.TotalAreaFragment" />
+    <column name="Results!*.Value.IsotopeDotProduct" />
+    <column name="Results!*.Value.LibraryDotProduct" />
+    <column name="Results!*.Value.RatioDotProduct" />
+    <column name="Results!*.Value.DetectionQValue" />
+    <column name="Results!*.Value.PeptideResult.ResultFile.Replicate.Locator" />
+    <column name="Peptide.Protein.Locator" />
+    <column name="Peptide.Locator" />
+    <column name="Locator" />
+    <filter column="IsDecoy" opname="equals" operand="False" />
+  </view>
+</views>

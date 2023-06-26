@@ -1,0 +1,1044 @@
+---
+title: Analyse direct infusion collision energy (NCE) scans
+author: "Jonas D. Förster"
+project:
+  execute-dir: file
+params:
+  rawfile: 'OE2-20230726_004'
+  # Where to find the rawfile if it is not in the local folder. Also searches subfolders in the AG Riemer year-month-date scheme.
+  rawfile_base_dir: 'E:/OE Raw data'
+  trans_types: y, b, a
+---
+
+# Info
+
+```{r setup}
+library(conflicted)
+library(here)
+library(tidyverse)
+library(MsRawAccess)
+library(MSTargetedWorkflows)
+library(patchwork)
+library(JuliaCall)
+conflicts_prefer(
+  dplyr::filter,
+  dplyr::lag,
+  .quiet = TRUE
+)
+Sys.setenv(JULIA_PROJECT = here())
+julia_setup()
+
+theme_set(theme_classic())
+```
+
+# Settings
+
+```{r settings}
+# increment this when substantially changing the analysis algorithm
+analysis_version <- 1
+
+# -> DO NOT EDIT/REMOVE THIS LINE <-
+# It is used for parameter injection for automated execution
+
+rawfile <- params$rawfile
+rawfile_base_dir <- params$rawfile_base_dir
+
+rawfile <- ensure_names(rawfile)
+
+rawfile_path <- find_rawfile(rawfile, base_path = rawfile_base_dir)
+
+# In case the file didn't end with a dummy scan, set final scan number, otherwise `NA`
+rawfile_scannumber_cutoff <- NA
+
+# window around precursor m/z (in m/z) which disqualifies transitions
+trans_precursor_ignore_window <- 2
+# minimum transition length
+trans_min_length <- 3
+# maximum neutral losses allowed
+trans_max_nl <- 2
+
+# select transition types, any of M, y, b, a for optimisation
+trans_types <- str_split_1(params$trans_types, coll(", "))
+# trans_types <- c("y", "b", "a")
+
+# up to how many transitions (per NCE) to include in the plot
+# also the lowest transition in the top x signal plot
+trans_top_x <- 6
+# min transition to put into top x signal evaluation plot
+trans_top_x_min <- 4
+
+# only pick optimum if at least a minimum of x transitions are seen.
+auto_pick_min_trans_count <- 6
+# for picking optima automatically, use top x transition
+auto_pick_top_x <- 4
+# Aim for sequence coverage for the auto picking.
+# Novel fragments will count only if the breaking point has not been seen yet.
+# In addition, one point is given the first time a match from n-term and c-term at the same breaking point is seen.
+# i.e. b3, b3-H2O, a3 in total only counts for 1
+# i.e. y2 and b7 from 9AA precursor initially count twice
+# i.e. y3 and b6 from 9AA precursor then only counts once
+auto_pick_seq_coverage_aim <- 6
+
+# The amount of different explicitly colored transitions in the ramp plot
+trans_colored_count <- 12
+# The top X cutoff for further colored transitions in the ramp plot
+relevant_trans_n <- 10
+
+# mz_pre_tol is not the final selection because we use compound annotation in the rawfile
+mz_pre_tol <- 0.02
+
+ppm_ms2_tol <- 9
+```
+
+# Preparations
+
+```{r}
+ramp_name <- "HCD Energy"
+ramp_axis_name <- "Normalized Collision Energy (%)"
+
+ramp_axis_label_every_nth <- 2
+```
+
+```{r}
+rawfile_name <- str_extract(basename(rawfile_path), "^.*(?=\\.raw$)")
+ramp_symbol <- as.symbol(ramp_name)
+
+stopifnot(!is.na(rawfile_path))
+stopifnot(trans_top_x >= auto_pick_top_x)
+stopifnot(auto_pick_top_x <= auto_pick_min_trans_count)
+
+filter_bad_transitions <- function(df) filter(df, fragmenttype == "M" | abs(pre_mz - mz) > trans_precursor_ignore_window / 2)
+# transitions used for ranking
+focus_transitions <- function(df) filter(df, fragmenttype %in% trans_types, ordinate >= trans_min_length)
+```
+
+```{r}
+headers_df <- 
+  rawfile_path %>%
+  extract_scan_headers_full() %>%
+  select(ScanNumber, StartTime, MsOrder, ScanMode, Compound, HighMass, PrecursorMasses, `AGC Target`, TIC, !!ramp_symbol) %>%
+  mutate(across(c(PrecursorMasses, `AGC Target`, !!ramp_symbol), as.numeric))
+
+if (!is.na(rawfile_scannumber_cutoff))
+  headers_df <- slice(headers_df, 1:rawfile_scannumber_cutoff)
+
+headers_fullms_df <- filter(headers_df, MsOrder == "Ms", ScanMode == "Full")
+headers_sim_df <- filter(headers_df, MsOrder == "Ms", ScanMode == "Sim")
+headers_ms2_df <- filter(headers_df, MsOrder == "Ms2")
+
+stopifnot(!any(is.na(headers_ms2_df$PrecursorMasses)))
+
+statuslog_df <- as_tibble(extract_status_log(rawfile_path))
+
+# headers_fullms_df
+# headers_sim_df
+```
+
+```{r}
+# some old files scanned through compounds multiple times
+# I want to separate the different scan groups to later check which one is best
+eval_groups_df <-
+  headers_ms2_df %>%
+  filter(!(Compound %in% c("", "#dummy", "!dummy"))) %>%
+  select(compound = Compound, ScanNumber, !!ramp_symbol, HighMass, PrecursorMasses) %>%
+  mutate(compound = seq_from_rawfile_to_unimod(compound)) %>%
+  arrange(ScanNumber)
+
+# in one or two files, i messed up compound charge annotation
+# this can be fixed here by the relationship between HighMass and PrecursorMasses metadata
+charge_state_0_df <-
+  eval_groups_df %>%
+  filter(str_extract(compound, "\\+*$") == "") %>%
+  mutate(compound = paste0(compound, str_dup("+", round(HighMass / PrecursorMasses)))) %>%
+  select(ScanNumber, compound)
+
+# legacy problem with one of the old files
+if (rawfile_name == "OE2-20200819_002")
+  eval_groups_df_new <-
+    eval_groups_df %>%
+    # TL[+7.017164]HEYMLDL -> TLHEYML[+7.017164]DL
+    mutate(compound = str_replace(compound, "^TL\\[\\+7\\.017164\\]HEYMLDL(\\++)$", "TLHEYML[+7.017164]DL\\1")) %>%
+    mutate(compound = str_replace(compound, "^TL\\[\\+7\\.017164\\]HEYM\\[\\+15\\.994915\\]LDL(\\++)$", "TLHEYM[+15.994915]L[+7.017164]DL\\1"))
+
+eval_groups_df <-
+  eval_groups_df %>%
+  select(-HighMass, -PrecursorMasses) %>%
+  rows_update(charge_state_0_df, by = "ScanNumber") %>%
+  mutate(eval_group = cumsum(compound != lag(compound, n = 1, default = first(compound))), .before = 1)
+
+ramp_scan_count <-
+  eval_groups_df %>%
+  filter(eval_group == 0L) %>%
+  count(!!ramp_symbol) %>%
+  pull(n) %>%
+  unique()
+
+# the ramps should uniformly scan all ramp values the same amount of times
+stopifnot(length(ramp_scan_count) == 1)
+
+ramp_vals <-
+  eval_groups_df %>%
+  pull(!!ramp_symbol) %>%
+  unique() %>%
+  sort()
+
+# typically at the end, there might be an unfinished series that is to be discarded here
+eval_groups_df <-
+  eval_groups_df %>%
+  group_by(eval_group, compound) %>%
+  filter(all(table(!!ramp_symbol) == ramp_scan_count), all(ramp_vals %in% !!ramp_symbol)) %>%
+  ungroup() %>%
+  mutate(compound = fct_inorder(compound))
+
+# if there is a very short eval group, my assumptions about the data structure are wrong
+stopifnot(all(count(eval_groups_df, eval_group)$n != 1))
+
+compounds <- levels(eval_groups_df$compound)
+
+every_nth <- function(x, nth, offset = 0) x[seq(1 + offset, length(x), by = nth)]
+ramp_axis_breaks <- function(nth, offset = 0) every_nth(ramp_vals, nth, offset = offset)
+```
+
+```{r}
+# invisible(julia_library("Revise"))
+invisible(julia_library("Peptidomics"))
+invisible(julia_library("MSUtils2"))
+
+julia_assign("compounds", compounds)
+julia_command("precursors = parse.(PrecursorIon, compounds);")
+julia_assign("trans_max_nl", trans_max_nl)
+julia_assign("trans_types", trans_types)
+transitions_df <-
+  julia_eval("MSUtils2.transition_df_from_precursors_select(precursors; ions = unique(vcat('M', only.(trans_types))), min_length = 1, max_nl_count = trans_max_nl)") %>%
+  as_tibble() %>%
+  mutate(
+    seq_mod = fct_inorder(seq_mod),
+    compound = fct_inorder(paste0(seq_mod_sil, str_dup("+", pre_charge)))
+  ) %>%
+  filter_bad_transitions()
+
+transitions_df
+```
+
+```{r}
+spray_current_plot <-
+  statuslog_df %>%
+  ggplot(aes(x = Time, y = `Spray Current (µA)`)) +
+  geom_step(direction = "hv") +
+  labs(x = "Time (min)")
+
+spray_current_plot
+```
+
+```{r}
+if (nrow(headers_fullms_df) > 0) {
+  tic_plot <-
+    headers_fullms_df %>%
+    ggplot(aes(x = StartTime, y = TIC)) +
+    geom_line() +
+    geom_point() +
+    coord_cartesian(ylim = c(0, NA))
+} else {
+  tic_plot <- ggplot()
+}
+tic_plot <- tic_plot + labs(x = "Time (min)", y = "TIC")
+
+tic_plot
+```
+
+```{r}
+if (nrow(headers_fullms_df) > 0) {
+  ms1_scans_df <-
+    extract_centroid_scans(rawfile_path, scanNumber = headers_fullms_df$ScanNumber) %>%
+    map(as_tibble) %>%
+    bind_rows() %>%
+    left_join(select(headers_fullms_df, ScanNumber, StartTime), by = join_by(ScanNumber), relationship = "many-to-one") %>%
+    mutate(scan_label = fct_inorder(formatC(StartTime, format = "f", digits = 2)))
+  
+  ms1_scan_plots <-
+    ms1_scans_df %>%
+    ggplot(aes(x = MZs, y = Intensities)) +
+    facet_grid(cols = vars(RT = scan_label), labeller = label_both) +
+    geom_col(width = 1, position = "identity") +
+    coord_cartesian(ylim = c(0, NA))
+} else {
+  ms1_scan_plots <- ggplot()
+}
+ms1_scan_plots <- ms1_scan_plots + labs(x = "m/z", y = "Intensity (a.u.)")
+
+ms1_scan_plots
+```
+
+```{r}
+# get XIC data for all compound, transition (by formula) combinations
+transition_xics_df <-
+  transitions_df %>%
+  select(compound, pre_mz, formula, mz) %>%
+  distinct(compound, formula, .keep_all = TRUE) %>%
+  mutate(xic_prm = extract_ms2_xic(rawfile_path, pre_mz, mz, mz_pre_tol, ppm_ms2_tol, precursor_tol_mode = "amu", transition_tol_mode = "ppm")) %>%
+  select(-pre_mz, -mz)
+
+# get a long table of all relevant xic data with only top intensity hits
+# this table has lost intensity == 0 data
+transition_xics_longer_df <-
+  transition_xics_df %>%
+  hoist(xic_prm, ScanNumber = "TransitionScanNumbers", Intensity = "Intensities", .remove = FALSE) %>%
+  select(-xic_prm) %>%
+  unchop(cols = c(ScanNumber, Intensity)) %>%
+  # strategy for when more than one peak matched within the tolerance
+  # take only the most intense
+  slice(which.max(Intensity), .by = c(compound, formula, ScanNumber))
+
+# assemble full compound, formula, xic df including intensity == 0 data
+transition_xics_by_ramp_df <-
+  transition_xics_df %>%
+  select(compound, formula) %>%
+  left_join(eval_groups_df, by = join_by(compound), relationship = "many-to-many") %>%
+  left_join(transition_xics_longer_df, by = join_by(compound, formula, ScanNumber), relationship = "one-to-many") %>%
+  left_join(select(headers_ms2_df, ScanNumber, RetentionTime = StartTime), by = join_by(ScanNumber), relationship = "many-to-one") %>%
+  replace_na(list(Intensity = 0)) %>%
+  nest(xic_prm = c(ScanNumber, RetentionTime, Intensity))
+
+# transition_xics_by_ramp_df
+```
+
+Merge identical transitions
+
+```{r}
+merge_identical_transitions <- function(df) {
+  merge_iondescs <- function(iondescs) {
+    table(fct_inorder(iondescs)) %>%
+      imap(~ {
+        if (.x == 1)
+          return(.y)
+        paste0(.x, "*", .y)
+      }) %>%
+      paste0(collapse = "|")
+  }
+  
+  df %>%
+    group_by(compound, formula) %>%
+    mutate(iondesc = merge_iondescs(iondesc)) %>%
+    slice(which.min(prio)) %>%
+    ungroup()
+}
+
+transitions_ramp_df <-
+  transitions_df %>%
+  merge_identical_transitions() %>%
+  arrange(compound, prio, ordinate) %>%
+  left_join(transition_xics_by_ramp_df, by = join_by(compound, formula), relationship = "one-to-many")
+```
+
+Only consider top X transitions for ease of analysis
+
+```{r}
+append_trans_top_n_info <- function(df) {
+  trans_intensity_means_df <-
+    df %>%
+    unnest(xic_prm) %>%
+    # keeping fragmenttype and ordinate around for focus_transitions()
+    summarize(
+      .by = c(eval_group, compound, !!ramp_symbol, iondesc, fragmenttype, ordinate),
+      trans_intensity_mean_per_step = mean(Intensity)
+    )
+  
+  transitions_intensity_sums_df <-
+    trans_intensity_means_df %>%
+    # keeping fragmenttype and ordinate around for focus_transitions()
+    summarize(
+      .by = c(eval_group, compound, iondesc, fragmenttype, ordinate),
+      trans_intensity_sum = sum(trans_intensity_mean_per_step)
+    )
+  
+  # rank transitions within each ramp step
+  transitions_top_n_df <-
+    trans_intensity_means_df %>%
+    focus_transitions() %>%
+    filter(trans_intensity_mean_per_step > 0) %>%
+    mutate(
+      .by = c(eval_group, compound, !!ramp_symbol),
+      iondesc,
+      trans_top_n_per_step = rank(-trans_intensity_mean_per_step, ties.method = "first"),
+      .keep = "none"
+    )
+
+  # calculate total intensity of focus transitions to understand the overall relevance
+  transitions_intensity_sum_ranks_df <-
+    transitions_intensity_sums_df %>%
+    focus_transitions() %>%
+    mutate(
+      .by = c(eval_group, compound),
+      iondesc,
+      trans_intensity_sum_rank = rank(-trans_intensity_sum, ties.method = "first"),
+      .keep = "none"
+    )
+  
+  df %>%
+    left_join(
+      select(trans_intensity_means_df, -fragmenttype, -ordinate),
+      by = join_by(eval_group, compound, !!ramp_symbol, iondesc),
+      relationship = "one-to-one"
+    ) %>%
+    left_join(
+      select(transitions_intensity_sums_df, -fragmenttype, -ordinate),
+      by = join_by(eval_group, compound, iondesc),
+      relationship = "many-to-one"
+    ) %>%
+    left_join(
+      transitions_top_n_df,
+      by = join_by(eval_group, compound, !!ramp_symbol, iondesc),
+      relationship = "one-to-one"
+    ) %>%
+    left_join(
+      transitions_intensity_sum_ranks_df,
+      by = join_by(eval_group, compound, iondesc),
+      relationship = "many-to-one"
+    )
+}
+
+transitions_ramp_df <- append_trans_top_n_info(transitions_ramp_df)
+
+transitions_ramp_df
+```
+
+```{r}
+fragmenttype_val <- c(a = -1L, b = -1L, c = -1L, x = 1L, y = 1L, z = 1L)
+# cumulative_n_distinct <- function(x) cumsum(!duplicated(x))
+cumulative_seq_coverage_score <- function(cut_position) {
+  cumsum(!duplicated(cut_position)) + pmin(cumsum(duplicated(cut_position)), 1)
+}
+
+append_seq_coverage <- function(df) {
+  seq_coverage_df <-
+    df %>%
+    filter(!is.na(trans_top_n_per_step)) %>%
+    # group_by(eval_group, compound, !!ramp_symbol) %>%
+    group_by(eval_group, compound, seq, !!ramp_symbol) %>%
+    arrange(trans_top_n_per_step, .by_group = TRUE) %>%
+    mutate(.keep = "none",
+      iondesc,
+      # seq_coverage_score_by_step = cumulative_n_distinct(fragmenttype_val[fragmenttype] * ordinate)
+      seq_coverage_score_by_step = cumulative_seq_coverage_score(if_else(fragmenttype_val[fragmenttype] == -1, ordinate, nchar(seq) - ordinate))
+    ) %>%
+    ungroup() %>%
+    select(-seq)
+  
+  left_join(
+    df, seq_coverage_df,
+    by = join_by(eval_group, compound, !!ramp_symbol, iondesc),
+    relationship = "one-to-one"
+  )
+}
+
+transitions_ramp_df <- append_seq_coverage(transitions_ramp_df)
+
+transitions_ramp_df
+```
+
+If compounds were targeted multiple times, select only the highest intensity set for analysis
+
+```{r}
+eval_groups_best_df <-
+  transitions_ramp_df %>%
+  filter(!is.na(trans_top_n_per_step)) %>%
+  distinct(eval_group, compound, iondesc, trans_intensity_sum) %>%
+  group_by(compound, eval_group) %>%
+  summarize(intensity_sum = sum(trans_intensity_sum), .groups = "drop_last") %>%
+  slice(which.max(intensity_sum)) %>%
+  ungroup() %>%
+  select(-intensity_sum)
+
+eval_groups_best_df <-
+  eval_groups_df %>%
+  select(compound, eval_group) %>%
+  distinct(compound, .keep_all = TRUE) %>%
+  rows_update(eval_groups_best_df, by = "compound")
+
+transitions_ramp_df <-
+  transitions_ramp_df %>%
+  left_join(mutate(eval_groups_best_df, is_best_eval_group = TRUE), by = join_by(eval_group, compound), relationship = "many-to-one") %>%
+  replace_na(list(is_best_eval_group = FALSE))
+```
+
+```{r}
+opt_picked_df <-
+  transitions_ramp_df %>%
+  filter(!is.na(trans_top_n_per_step)) %>%
+  group_by(eval_group, seq_mod, pre_charge, !!ramp_symbol) %>%
+  filter(any(trans_top_n_per_step >= auto_pick_min_trans_count)) %>%
+  ungroup(!!ramp_symbol) %>%
+  filter(trans_top_n_per_step == auto_pick_top_x) %>%
+  slice(which.max(trans_intensity_mean_per_step)) %>%
+  ungroup() %>%
+  select(eval_group, seq_mod, pre_charge, nce_top_i = !!ramp_symbol)
+
+# aims for best sequence coverage
+# falls back gracefully towards the top_n goal, if sequence coverage cant be reached
+opt_picked_plus_seq_df <-
+  transitions_ramp_df %>%
+  filter(!is.na(trans_top_n_per_step)) %>%
+  group_by(eval_group, seq_mod, pre_charge, !!ramp_symbol) %>%
+  filter(any(trans_top_n_per_step >= auto_pick_min_trans_count)) %>%
+  ungroup(!!ramp_symbol) %>%
+  filter(seq_coverage_score_by_step <= auto_pick_seq_coverage_aim, trans_top_n_per_step >= auto_pick_top_x) %>%
+  group_by(seq_coverage_score_by_step, .add = TRUE) %>%
+  slice(which.max(trans_intensity_mean_per_step)) %>%
+  ungroup(seq_coverage_score_by_step) %>%
+  slice(which.max(seq_coverage_score_by_step)) %>%
+  ungroup() %>%
+  select(eval_group, seq_mod, pre_charge, nce_seq_cov = !!ramp_symbol)
+
+opt_df <-
+  transitions_ramp_df %>%
+  filter(is_best_eval_group) %>%
+  distinct(eval_group, seq_mod, pre_charge) %>%
+  left_join(
+    opt_picked_df,
+    by = join_by(eval_group, seq_mod, pre_charge),
+    relationship = "many-to-one"
+  ) %>%
+  left_join(
+    opt_picked_plus_seq_df,
+    by = join_by(eval_group, seq_mod, pre_charge),
+    relationship = "many-to-one"
+  ) %>%
+  select(-eval_group) %>%
+  mutate(across(c(nce_top_i, nce_seq_cov), as.character)) %>%
+  replace_na(list(nce_top_i = "weak", nce_seq_cov = "weak")) %>%
+  mutate(nce_rawfile = rawfile_name)
+
+opt_df
+
+write_csv(opt_df, paste0(rawfile_name, "_nce_opt.csv"))
+```
+
+```{r}
+example_precursor_df <-
+  transitions_df %>%
+  distinct(seq_mod, pre_charge) %>%
+  slice(1)
+
+example_peptide_df <- select(example_precursor_df, -pre_charge)
+
+example_precursor_df
+```
+
+# Analysis by sets of ramps
+
+```{r}
+gen_precursor_ramp_stability_plot <- function(sel_trans_df, sel_pre_df) {
+  timepoint_df <-
+    sel_trans_df %>%
+    unnest(xic_prm) %>%
+    mutate(n_ramp_val = unclass(factor(!!ramp_symbol, levels = ramp_vals))) %>%
+    distinct(ScanNumber, RetentionTime, !!ramp_symbol, n_ramp_val)
+  
+  sel_trans_df <- filter(sel_trans_df, trans_intensity_mean_per_step > 0)
+  
+  plot_labs <- labs(
+    x = ramp_axis_name,
+    y = "Time (min)"
+  )
+  
+  if (nrow(timepoint_df) == 0)
+    return(ggplot() + plot_labs)
+  
+  if (nrow(sel_trans_df) == 0) {
+    out_plot <- ggplot(timepoint_df, aes(x = n_ramp_val, y = RetentionTime, group = !!ramp_symbol))
+  } else {
+    trans_int_df <-
+      sel_trans_df %>%
+      unnest(xic_prm) %>%
+      summarize(
+        .by = ScanNumber,
+        trans_intensity_sum = sum(Intensity)
+      ) %>%
+      right_join(timepoint_df, by = join_by(ScanNumber), relationship = "one-to-one") %>%
+      replace_na(list(trans_intensity_sum = 0))
+    
+    max_int <- max(trans_int_df$trans_intensity_sum)
+    if (max_int == 0)
+      max_int <- 1
+    
+    out_plot <-
+      ggplot(trans_int_df, aes(x = n_ramp_val, y = RetentionTime, group = !!ramp_symbol)) +
+      geom_ribbon(aes(xmin = n_ramp_val - trans_intensity_sum / max_int / 2, xmax = n_ramp_val + trans_intensity_sum / max_int / 2))
+  }
+  
+  out_plot <- out_plot +
+    geom_point(color = "red") +
+    scale_x_continuous(breaks = every_nth(seq_along(ramp_vals), ramp_axis_label_every_nth), minor_breaks = seq_along(ramp_vals), labels = ramp_axis_breaks(ramp_axis_label_every_nth)) +
+    scale_y_reverse() +
+    coord_cartesian(xlim = c(1, length(ramp_vals))) +
+    plot_labs
+  
+  out_plot
+}
+
+transitions_ramp_df %>%
+  filter(is_best_eval_group) %>%
+  inner_join(example_precursor_df, by = join_by(seq_mod, pre_charge)) %>%
+  group_by(eval_group, seq_mod, pre_charge) %>%
+  group_map(gen_precursor_ramp_stability_plot) %>%
+  walk(print)
+```
+
+```{r}
+gen_precursor_ramp_topx_plot <- function(sel_trans_df, sel_pre_df) {
+  opt_val <- inner_join(opt_picked_df, sel_pre_df, by = join_by(eval_group, seq_mod, pre_charge))$nce_top_i
+  opt_val_seq <- inner_join(opt_picked_plus_seq_df, sel_pre_df, by = join_by(eval_group, seq_mod, pre_charge))$nce_seq_cov
+  
+  sel_trans_df <-
+    sel_trans_df %>%
+    filter(!is.na(trans_top_n_per_step)) %>%
+    distinct(iondesc, !!ramp_symbol, trans_top_n_per_step, trans_intensity_mean_per_step)
+  
+  transint_min_to_max_df <-
+    expand_grid(
+      !!ramp_symbol := ramp_vals,
+      trans_top_n_per_step = trans_top_x_min:trans_top_x
+    ) %>%
+    left_join(sel_trans_df, by = join_by(!!ramp_symbol, trans_top_n_per_step), relationship = "one-to-one") %>%
+    replace_na(list(trans_intensity_mean_per_step = 0))
+
+  plot <-
+    transint_min_to_max_df %>%
+    ggplot(aes(x = !!ramp_symbol, y = trans_intensity_mean_per_step)) +
+    geom_area(aes(fill = factor(trans_top_n_per_step)), position = "identity")
+  
+  if (!is_empty(opt_val)) {
+    if (sel_pre_df$is_best_eval_group) {
+      marker_linetype <- "solid"
+      marker_width <- 2
+    } else {
+      marker_linetype <- "dotted"
+      marker_width <- 1
+    }
+    plot <- plot + annotate("segment", x = opt_val, xend = opt_val, y = -Inf, yend = 0, linewidth = marker_width, color = "red", linetype = marker_linetype)
+  }
+  if (!is_empty(opt_val_seq)) {
+    if (sel_pre_df$is_best_eval_group) {
+      marker_linetype <- "solid"
+      marker_width <- 1.5
+    } else {
+      marker_linetype <- "dotted"
+      marker_width <- 1
+    }
+    plot <- plot + annotate("segment", x = opt_val_seq, xend = opt_val_seq, y = -Inf, yend = 0, linewidth = marker_width, color = "green", linetype = marker_linetype)
+  }
+  
+  plot +
+    scale_x_continuous(breaks = ramp_axis_breaks(ramp_axis_label_every_nth), minor_breaks = ramp_vals) +
+    scale_y_continuous(labels = scales::label_scientific()) +
+    coord_cartesian(xlim = range(ramp_vals), ylim = c(0, NA), default = TRUE) +
+    labs(
+      x = ramp_axis_name,
+      y = "Intensity (a.u.)",
+      fill = "Top <X> transition"
+    )
+}
+
+transitions_ramp_df %>%
+  filter(is_best_eval_group) %>%
+  inner_join(example_precursor_df, by = join_by(seq_mod, pre_charge)) %>%
+  group_by(eval_group, seq_mod, pre_charge, is_best_eval_group) %>%
+  group_map(gen_precursor_ramp_topx_plot) %>%
+  walk(print)
+```
+
+```{r}
+gen_precursor_ramp_intensity_plot <- function(sel_trans_df, sel_pre_df) {
+  sel_trans_df <-
+    sel_trans_df %>%
+    filter(!is.na(trans_top_n_per_step)) %>%
+    arrange(trans_intensity_sum_rank)
+  
+  label_other <- "<Other>"
+  label_further <- paste0("<Further Top ", relevant_trans_n, ">")
+  
+  # Those that are relevant but got cut because of too many colors
+  sel_trans_recolored_df <-
+    sel_trans_df %>%
+    filter(trans_intensity_sum_rank > trans_colored_count, trans_top_n_per_step <= relevant_trans_n) %>%
+    mutate(iondesc = label_further)
+  
+  # all others
+  sel_trans_irrelevant_df <-
+    sel_trans_df %>%
+    filter(trans_intensity_sum_rank > trans_colored_count, trans_top_n_per_step > relevant_trans_n) %>%
+    # ensure that all ramp values are present
+    right_join(tibble(!!ramp_symbol := ramp_vals), by = join_by(!!ramp_symbol), relationship = "many-to-one") %>%
+    mutate(iondesc = label_other) %>%
+    replace_na(list(trans_intensity_mean_per_step = 0))
+  
+  sel_trans_colored_df <- filter(sel_trans_df, trans_intensity_sum_rank <= trans_colored_count)
+  
+  # ensure that all ramp values are present
+  pre_mean_sd_df <- tibble(!!ramp_symbol := ramp_vals, pre_intensity_mean = 0, pre_intensity_sd = 0)
+  if (nrow(sel_trans_colored_df) + nrow(sel_trans_recolored_df) > 0) {
+    pre_mean_sd_df <-
+      bind_rows(sel_trans_colored_df, sel_trans_recolored_df) %>%
+      unnest(xic_prm) %>%
+      group_by(!!ramp_symbol, ScanNumber) %>%
+      summarize(pre_intensity_sum = sum(Intensity), .groups = "drop_last") %>%
+      summarize(
+        pre_intensity_mean = mean(pre_intensity_sum),
+        pre_intensity_sd = sd(pre_intensity_sum),
+        .groups = "drop"
+      ) %>%
+      rows_update(pre_mean_sd_df, ., by = ramp_name)
+  }
+  
+  iondescs <- unique(sel_trans_colored_df$iondesc)
+  iondesc_breaks <- c(iondescs, label_further, label_other)
+  iondesc_plotorder <- c(label_other, label_further, rev(iondescs))
+  iondesc_colors <- c(scales::hue_pal()(length(iondesc_breaks) - 1), "grey80")
+  # iondesc_borders <- c(rep(NA_real_, length(iondescs)), 0.01, 0.01)
+  
+  bind_rows(
+    sel_trans_irrelevant_df,
+    sel_trans_colored_df,
+    sel_trans_recolored_df
+  ) %>%
+    mutate(
+      iondesc = factor(iondesc, levels = iondesc_plotorder),
+      border = if_else(iondesc %in% c(label_further, label_other), 0.01, NA_real_)
+    ) %>%
+    ggplot(aes(x = !!ramp_symbol, y = trans_intensity_mean_per_step)) +
+    geom_col(aes(fill = iondesc, linewidth = border), color = "grey90") +
+    geom_errorbar(data = pre_mean_sd_df, aes(y = pre_intensity_mean, ymin = pre_intensity_mean - pre_intensity_sd, ymax = pre_intensity_mean + pre_intensity_sd)) +
+    scale_x_continuous(breaks = ramp_axis_breaks(ramp_axis_label_every_nth), minor_breaks = ramp_vals) +
+    scale_y_continuous(labels = scales::label_scientific()) +
+    scale_fill_manual(values = iondesc_colors, breaks = iondesc_breaks) +
+    scale_linewidth_identity(guide = "none") +
+    # scale_linewidth_manual(values = iondesc_borders, breaks = iondesc_breaks) +
+    coord_cartesian(xlim = range(ramp_vals), ylim = c(0, NA), default = TRUE) +
+    labs(
+      x = ramp_axis_name,
+      y = "Intensity (a.u.)",
+      fill = "Transition",
+      color = "Transition",
+      size = "Transition"
+    )
+}
+
+transitions_ramp_df %>%
+  filter(is_best_eval_group) %>%
+  inner_join(example_precursor_df, by = join_by(seq_mod, pre_charge)) %>%
+  group_by(seq_mod, pre_charge) %>%
+  group_map(gen_precursor_ramp_intensity_plot) %>%
+  walk(print)
+```
+
+```{r}
+gen_precursor_ramp_all_intensity_plot <- function(sel_trans_df, sel_pre_df) {
+  categories <- c("[M] based", paste0("Ion >= ", trans_min_length, " AA"), paste0("Ion < ", trans_min_length, " AA"))
+  
+  all_data_df <-
+    sel_trans_df %>%
+    mutate(category = case_when(
+      fragmenttype == "M" ~ categories[1],
+      ordinate >= trans_min_length ~ categories[2],
+      ordinate < trans_min_length ~ categories[3]
+    )) %>%
+    arrange(trans_intensity_sum_rank)
+  
+  sel_trans_df <- filter(all_data_df,
+    category == categories[2],
+    !is.na(trans_top_n_per_step)
+  )
+  
+  label_M <- paste0("[M+", sel_pre_df$pre_charge, "H]", sel_pre_df$pre_charge, "+")
+  label_other <- "<Other>"
+  label_further <- paste0("<Further Top ", relevant_trans_n, ">")
+  
+  # Those that are relevant but got cut because of too many colors
+  sel_trans_recolored_df <-
+    sel_trans_df %>%
+    filter(trans_intensity_sum_rank > trans_colored_count, trans_top_n_per_step <= relevant_trans_n) %>%
+    mutate(iondesc = label_further)
+  
+  # all others
+  sel_trans_irrelevant_df <-
+    all_data_df %>%
+    filter(is.na(trans_top_n_per_step) | trans_top_n_per_step > relevant_trans_n) %>%
+    # ensure that all ramp values are present
+    right_join(expand_grid(!!ramp_symbol := ramp_vals, category = categories), by = join_by(!!ramp_symbol, category), relationship = "many-to-one") %>%
+    mutate(iondesc = if_else(fragmenttype == "M" & nl_count == 0, label_M, label_other)) %>%
+    replace_na(list(trans_intensity_mean_per_step = 0))
+  
+  sel_trans_colored_df <- filter(sel_trans_df, trans_intensity_sum_rank <= trans_colored_count)
+  
+  # ensure that all ramp values are present
+  pre_mean_sd_df <- tibble(!!ramp_symbol := ramp_vals, category = categories[2], pre_intensity_mean = 0, pre_intensity_sd = 0)
+  if (nrow(sel_trans_colored_df) + nrow(sel_trans_recolored_df) > 0) {
+    pre_mean_sd_df <-
+      bind_rows(sel_trans_colored_df, sel_trans_recolored_df) %>%
+      unnest(xic_prm) %>%
+      group_by(!!ramp_symbol, ScanNumber) %>%
+      summarize(pre_intensity_sum = sum(Intensity), .groups = "drop_last") %>%
+      summarize(
+        pre_intensity_mean = mean(pre_intensity_sum),
+        pre_intensity_sd = sd(pre_intensity_sum),
+        .groups = "drop"
+      ) %>%
+      rows_update(pre_mean_sd_df, ., by = ramp_name)
+  }
+  
+  iondescs <- unique(sel_trans_colored_df$iondesc)
+  iondesc_breaks <- c(label_M, iondescs, label_further, label_other)
+  iondesc_plotorder <- c(label_other, label_further, rev(iondescs), label_M)
+  iondesc_colors <- c("grey45", scales::hue_pal()(length(iondescs) + 1), "grey80")
+  
+  bind_rows(
+    sel_trans_irrelevant_df,
+    sel_trans_colored_df,
+    sel_trans_recolored_df
+  ) %>%
+    mutate(
+      iondesc = factor(iondesc, levels = iondesc_plotorder),
+      category = factor(category, levels = categories),
+      border = if_else(iondesc %in% c(label_M, label_further, label_other), 0.01, NA_real_)
+    ) %>%
+    ggplot(aes(x = !!ramp_symbol, y = trans_intensity_mean_per_step)) +
+    # for some reason I need to keep the factor conversion for the facetting, even though its already a factor
+    facet_grid(rows = vars(factor(category)), drop = FALSE, scales = "free_y") +
+    geom_col(aes(fill = iondesc, linewidth = border), color = "grey90") +
+    geom_errorbar(data = pre_mean_sd_df, aes(y = pre_intensity_mean, ymin = pre_intensity_mean - pre_intensity_sd, ymax = pre_intensity_mean + pre_intensity_sd)) +
+    scale_x_continuous(breaks = ramp_axis_breaks(ramp_axis_label_every_nth), minor_breaks = ramp_vals) +
+    scale_y_continuous(labels = scales::label_scientific()) +
+    scale_fill_manual(values = iondesc_colors, breaks = iondesc_breaks, labels = iondesc_breaks) +
+    scale_linewidth_identity(guide = "none") +
+    coord_cartesian(xlim = range(ramp_vals), ylim = c(0, NA), default = TRUE) +
+    labs(
+      x = ramp_axis_name,
+      y = "Intensity (a.u.)",
+      fill = "Transition",
+      color = "Transition",
+      size = "Transition"
+    )
+}
+
+transitions_ramp_df %>%
+  filter(is_best_eval_group) %>%
+  inner_join(example_precursor_df, by = join_by(seq_mod, pre_charge)) %>%
+  group_by(eval_group, seq_mod, pre_charge, is_best_eval_group) %>%
+  group_map(gen_precursor_ramp_all_intensity_plot) %>%
+  walk(print)
+```
+
+```{r}
+panel_count <-
+  transitions_ramp_df %>%
+  filter(is_best_eval_group) %>%
+  distinct(seq_mod, pre_charge) %>%
+  count(seq_mod) %>%
+  pull(n) %>%
+  max()
+
+# fix to two columns
+if (panel_count > 1)
+  panel_count <- ceiling(panel_count / 2) * 2
+
+gen_peptide_plot <- function(sel_trans_df, sel_pep_df) {
+  precursor_plots_df <-
+    sel_trans_df %>%
+    filter(is_best_eval_group) %>%
+    group_by(!!!sel_pep_df, pre_charge, eval_group, is_best_eval_group) %>%
+    group_modify(~ tibble(
+      title = paste0(seq_from_unimod_to_3letter(sel_pep_df$seq_mod), str_dup("+", .y$pre_charge)),
+      precursor_ramp_stability_plot = list(gen_precursor_ramp_stability_plot(.x, .y)),
+      precursor_ramp_topx_plot = list(gen_precursor_ramp_topx_plot(.x, .y)),
+      precursor_ramp_intensity_plot = list(gen_precursor_ramp_intensity_plot(.x, .y)),
+    ))
+  
+  layout_plots <- function(i) {
+    if (i > nrow(precursor_plots_df))
+      return(ggplot())
+    wrap_plots(
+      precursor_plots_df$precursor_ramp_stability_plot[[i]] +
+        labs(
+          subtitle = precursor_plots_df$title[[i]],
+          x = NULL
+        ) +
+        theme(axis.text.x = element_blank()),
+      precursor_plots_df$precursor_ramp_topx_plot[[i]] +
+        labs(x = NULL) +
+        theme(axis.text.x = element_blank()),
+      precursor_plots_df$precursor_ramp_intensity_plot[[i]],
+      ncol = 1, heights = c(2, 2, 4), guides = "collect"
+    )
+  }
+  
+  if (panel_count == 1)
+    return(layout_plots(1))
+  
+  plots_list <- map(1:panel_count, layout_plots)
+
+  precursor_ramp_plots <- plots_list[[1]]
+  for (i in 2:length(plots_list)) {
+    if (i == 2)
+      precursor_ramp_plots <- precursor_ramp_plots - plots_list[[i]]
+    else
+      precursor_ramp_plots <- precursor_ramp_plots + plots_list[[i]]
+  }
+  
+  precursor_ramp_plots <-
+    precursor_ramp_plots +
+    plot_layout(ncol = 2, byrow = FALSE)
+
+  top_trans_df <- filter(sel_trans_df, !is.na(trans_top_n_per_step), trans_top_n_per_step <= relevant_trans_n)
+  if (nrow(top_trans_df) == 0) {
+    intensity_max <- 0
+  } else {
+    intensity_max <-
+      top_trans_df %>%
+      summarize(
+        .by = c(pre_charge, !!ramp_symbol),
+        pre_intensity_sum = sum(trans_intensity_mean_per_step)
+      ) %>%
+      pull(pre_intensity_sum) %>%
+      max()
+  }
+
+  precursor_comparison_plot <-
+    1:panel_count %>%
+    map(~ {
+      if (.x > nrow(precursor_plots_df))
+        return(ggplot())
+      precursor_plots_df$precursor_ramp_intensity_plot[[.x]] +
+        coord_cartesian(xlim = range(ramp_vals), ylim = c(0, intensity_max)) +
+        guides(fill = "none") +
+        labs(subtitle = precursor_plots_df$title[[.x]])
+    }) %>%
+    wrap_plots(nrow = 1)
+
+  wrap_plots(
+    precursor_ramp_plots,
+    ggplot() + theme(panel.background = element_rect(fill = "black", color  =  NA)),
+    precursor_comparison_plot,
+    ncol = 1, heights = c(8 * panel_count / 2, 0.01, 1.99)
+  )
+}
+
+transitions_ramp_df %>%
+  filter(is_best_eval_group) %>%
+  inner_join(example_peptide_df, by = join_by(seq_mod)) %>%
+  group_by(seq_mod) %>%
+  group_map(gen_peptide_plot) %>%
+  walk(print)
+```
+
+```{r}
+gen_peptide_detail_plot <- function(sel_trans_df, sel_pre_df) {
+  title <- paste0(seq_from_unimod_to_3letter(sel_pre_df$seq_mod), str_dup("+", sel_pre_df$pre_charge))
+  precursor_ramp_stability_plot <- gen_precursor_ramp_stability_plot(sel_trans_df, sel_pre_df)
+  precursor_ramp_topx_plot <- gen_precursor_ramp_topx_plot(sel_trans_df, sel_pre_df)
+  precursor_ramp_all_intensity_plot <- gen_precursor_ramp_all_intensity_plot(sel_trans_df, sel_pre_df)
+  
+  wrap_plots(
+    precursor_ramp_stability_plot + labs(x = NULL) + theme(axis.text.x = element_blank()),
+    precursor_ramp_topx_plot + labs(x = NULL) + theme(axis.text.x = element_blank()),
+    precursor_ramp_all_intensity_plot,
+    ncol = 1, heights = c(0.15, 0.15, 0.7)
+  ) +
+    plot_annotation(title = title)
+}
+
+transitions_ramp_df %>%
+  inner_join(example_precursor_df, by = join_by(seq_mod, pre_charge)) %>%
+  group_by(seq_mod, pre_charge, eval_group, is_best_eval_group) %>%
+  group_map(gen_peptide_detail_plot) %>%
+  walk(print)
+```
+
+```{r}
+transitions_ramp_df %>%
+  filter(trans_intensity_sum > 0) %>%
+  unnest(xic_prm) %>%
+  saveRDS(paste0(rawfile_name, "_nce_ramp_eval.rds"))
+```
+
+```{r}
+# pep_set_df <- transitions_ramp_df %>% distinct(seq_mod) %>% slice(9:11)
+
+pdf_scale <- 0.65
+
+if (panel_count == 1) {
+  pdf_width <- 15 * pdf_scale
+  pdf_height <- 8 * pdf_scale
+} else {
+  pdf_width <- 30 * pdf_scale
+  pdf_height <- (8 * panel_count / 2 + 4) * pdf_scale
+}
+
+pdf(paste0(rawfile_name, "_nce_ramp_eval.pdf"), width = pdf_width, height = pdf_height)
+
+print(wrap_plots(spray_current_plot, tic_plot, ms1_scan_plots, ncol = 1))
+
+transitions_ramp_df %>%
+  # inner_join(pep_set_df, by = join_by(seq_mod)) %>%
+  group_by(seq_mod) %>%
+  group_map(gen_peptide_plot) %>%
+  walk(print)
+invisible(dev.off())
+```
+
+```{r}
+pdf_scale <- 0.65
+
+pdf_width <- 15 * pdf_scale
+pdf_height <- 22 * pdf_scale
+
+pdf(paste0(rawfile_name, "_nce_ramp_eval_details.pdf"), width = pdf_width, height = pdf_height)
+
+print(wrap_plots(spray_current_plot, tic_plot, ms1_scan_plots, ncol = 1))
+
+transitions_ramp_df %>%
+  # inner_join(pep_set_df, by = join_by(seq_mod)) %>%
+  arrange(compound, eval_group) %>%
+  group_by(eval_group, seq_mod, pre_charge, is_best_eval_group) %>%
+  group_map(gen_peptide_detail_plot) %>%
+  walk(print)
+invisible(dev.off())
+```
+
+```{r}
+transitions_ramp_df %>%
+  filter(compound == "DLQPETTDL[Label:13C(6)15N(1)]Y++") %>%
+  group_by(eval_group, seq_mod, pre_charge, is_best_eval_group) %>%
+  group_map(gen_precursor_ramp_all_intensity_plot) %>%
+  walk(print)
+  # walk(~ saveRDS(.x, "dlqpettdly_nce_opt_all.rds"))
+```
+
+# Write out settings
+
+```{r}
+settings <- paste0(
+  "analysis_version = ", analysis_version, "\n",
+  "rawfile = ", rawfile, "\n",
+  "rawfile_base_dir = ", rawfile_base_dir, "\n",
+  "rawfile_path = ", rawfile_path, "\n",
+  "rawfile_scannumber_cutoff = ", rawfile_scannumber_cutoff, "\n",
+  "ramp_name = ", ramp_name, "\n",
+  "ramp_axis_name = ", ramp_axis_name, "\n",
+  "ramp_axis_label_every_nth = ", ramp_axis_label_every_nth, "\n",
+  "trans_precursor_ignore_window = ", trans_precursor_ignore_window, "\n",
+  "trans_min_length = ", trans_min_length, "\n",
+  "trans_max_nl = ", trans_max_nl, "\n",
+  "trans_types = ", paste0(trans_types, collapse = ", "), "\n",
+  "trans_top_x = ", trans_top_x, "\n",
+  "trans_top_x_min = ", trans_top_x_min, "\n",
+  "auto_pick_top_x = ", auto_pick_top_x, "\n",
+  "auto_pick_min_trans_count = ", auto_pick_min_trans_count, "\n",
+  "auto_pick_seq_coverage_aim = ", auto_pick_seq_coverage_aim, "\n",
+  "trans_colored_count = ", trans_colored_count, "\n",
+  "relevant_trans_n = ", relevant_trans_n, "\n",
+  "mz_pre_tol = ", mz_pre_tol, "\n",
+  "ppm_ms2_tol = ", ppm_ms2_tol, "\n"
+)
+
+cat(settings, file = paste0(rawfile_name, "_settings.txt"))
+```

@@ -1,0 +1,3 @@
+# this list is used as a working list for the !prepare_peptide_order.qmd file
+# Use lowercase letters for fully stable isotope labelled amino acids
+PEPTiDE

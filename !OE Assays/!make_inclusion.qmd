@@ -1,0 +1,139 @@
+---
+title: Make inclusion lists for unscheduled / DDA type methods
+author: "Jonas D. Förster"
+project:
+    execute-dir: file
+---
+
+# Info
+
+Uses data in '!Peptide Lists/optimized_oe' to make an inclusion list of precursors for e.g. iDDA (inclusion list DDA) finding peptide retention times.
+
+# Setup
+
+```{r setup}
+source("!make_inclusion_code.R")
+eval(code$setup)
+```
+
+# Settings
+
+```{r settings}
+# define the peptides targeted here, based on the .txt lists in the folder '!Peptide Lists'
+peptide_set <- c("peptide_list")
+
+# remove peptides, where irt is already known?
+# use this to make an assay that aims to find exclusively peptides that have not been discovered so far.
+remove_discovered_peptides <- FALSE
+
+# The best precursors charge states are marked in the optimization file.
+# The precursors are marked with a priority value. Typically, each peptide will have one best precursor marked with '1'.
+# Here you can decide to also include further precursors down the ranking (e.g. +++ in addition to ++)
+# Only use selected favorable precursors? 
+preferred_precursors_only <- FALSE
+preferred_precursors_include_priority <- 1 # 1 is default, to include only the best precursor
+
+# select between nce optimised for top fragment intensity (top_i) or sequence coverage (seq_cov)
+nce_type <- top_i
+# nce_type <- seq_cov
+
+nce_default <- 28
+# only add precursors, with known, optimized NCE
+nce_only_optimized <- FALSE
+
+rf_default <- 50
+# only add precursors, with known, optimized RF Lens
+rf_only_optimized <- FALSE
+
+# the set of irts that is targeted in the assay
+# irts <- irt_list$pierce_15
+irts <- irt_list$prtc_jptrt_26
+```
+
+## Filters
+
+```{r filters}
+# custom rules can be defined here to manipulate the inclusion list
+inclusion_filters <- lst(
+  # ~ filter(.x, pre_charge < 4), # discard unwanted charge states
+  # ~ filter(.x, str_count(seq, coll("M")) == str_count(seq_mod, coll("M[Oxidation]"))), # discard unoxidized M precursors
+  # ~ filter(.x, str_count(seq, coll("C")) == str_count(seq_mod, coll("C[Carbamidomethyl]"))), # discard unmodified cysteines
+  # ~ filter(.x, !str_detect(seq_mod, coll("C[Carbamidomethyl]"))), # discard modified cysteines
+  # ~ filter(.x, difftime(Sys.Date(), irt_date, unit = "days") > 25), # keep/drop peptides for which the iRT reference is outdated
+)
+```
+
+# Processing
+
+```{r}
+out_dir <- "inclusion_lists"
+if (!dir.exists(out_dir))
+  dir.create(out_dir)
+```
+
+```{r}
+eval(code$process_settings)
+```
+
+```{r}
+# Compute a name for the assay
+# Using options `peptide_set`
+# Either just the singular name of the selected peptide set or an abbreviated concatenation of all.
+eval(code$compute_peptide_set_name)
+```
+
+```{r}
+# Read in static precursor data (chemical formula, mz, charge, etc)
+# Using options `peptide_set`
+# From relevant !Peptide Lists/precursors/<peptide_set>.csv files
+eval(code$readin_precursors)
+
+# precursors_df
+```
+
+```{r}
+# Read in precursor optimization data (preferred precursor, collision energy, rt, etc)
+# Using options `peptide_set`
+# From !Peptide Lists/optimized_oe/!all_peptides.csv
+eval(code$readin_precursor_optimizations)
+
+# optimizations_df
+```
+
+```{r}
+# Integrate the recommended effective quadrupole isolation limits according to the thermo oe manual
+eval(code$quad_isolation_rules)
+
+# oe_quadrupole_iso_df
+```
+
+```{r}
+eval(code$make_inclusion)
+
+# inclusion_full_df
+```
+
+```{r}
+# calculate a m/z range for ms1 such that all precursors are included
+ms1_range <- c(floor(min(inclusion_full_df$mz_heavy) - 1.5), ceiling(max(inclusion_full_df$mz_heavy) + 1.5))
+ms1_range_label <- paste0(ms1_range, collapse = "_")
+cat0("Precursor mz range (rounded with safe margins) to consider for MS1 scan: ", ms1_range[1], " - ", ms1_range[2], "\n")
+```
+
+```{r}
+eval(code$write_out)
+
+# inclusion_out_df
+# inclusion_tsim_out_df
+```
+
+# Mix permutations
+
+```{r}
+# Calculate which combinations of peptide mixes allow for complete coverage of all target peptides.
+eval(code$calculate_peptide_mixes)
+```
+
+```{r include=FALSE}
+cat0("Finished: ", date(), "\n")
+```

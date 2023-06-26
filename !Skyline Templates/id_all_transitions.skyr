@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<views>
+  <view name="id_all_transitions" rowsource="pwiz.Skyline.Model.Databinding.Entities.Transition" sublist="Results!*" uimode="proteomic">
+    <column name="Results!*.Value.PrecursorResult.PeptideResult.ResultFile.Replicate.Locator" />
+    <column name="Precursor.Locator" />
+    <column name="FragmentIon" />
+    <column name="FragmentIonType" />
+    <column name="FragmentIonOrdinal" />
+    <column name="ProductCharge" />
+    <column name="ProductMz" />
+    <column name="Results!*.Value.PeakRankByLevel" />
+    <column name="Results!*.Value.Area" />
+    <column name="Results!*.Value.Background" />
+    <column name="LibraryRank" />
+    <column name="LibraryIntensity" />
+    <column name="Quantitative" />
+    <column name="Results!*.Value.Coeluting" />
+    <column name="Results!*.Value.Chromatogram.ChromatogramSource" />
+    <column name="Locator" />
+  </view>
+</views>

@@ -1,0 +1,86 @@
+---
+title: Read in peptide rt information
+author: "Jonas D. Förster"
+project:
+  execute-dir: file
+params:
+  # The folder where the id_all_precursors.csv is located. Relative to the project root.
+  detection_folder: prtc\55min PRM speclib
+---
+
+# Info
+
+Submit iRT data for a set of peptides.
+iRT data is anchored to the iRT master peptides defined in "!irt_master_list.txt".
+
+Uses skyline id_all.csv (!Skyline Templates/id_all.skyr) export.
+The skyline file should contain the iRT peaks and target peptide peaks.
+The iRT peptide info is used to calculate the iRT value of the target peptides.
+The target peptide iRT information is then submitted to the optimization database (.csv files).
+Peptides may have multipe RTs submitted in one go. In that case both are stored and later scripts will usually implement windows covering all of them.
+
+# Setup
+
+```{r setup}
+# code is outsourced to speed up interactive use of this file
+source("!submit_rt_oe_code.R")
+eval(code$setup)
+```
+
+# Settings
+
+```{r}
+# the location of the optimizations folder
+opt_folder <- "optimized_oe"
+```
+
+# Processing
+
+```{r}
+# Read in the data of the skyline id_all.csv export
+# Includes precursor information and especially the RT for all picked peaks
+eval(code$readin_id_all)
+```
+
+```{r}
+# Gather the RT for the iRT peptides, which will serve as the anchoring points.
+# At least 2 of the iRT peptides need to be present in the submitted file or an error is thrown.
+eval(code$gather_irt_rt)
+
+# prtc_df
+```
+
+```{r}
+# Gather the RT for all target peptides in the id_all.csv
+# Peptides present in the file, for which no peak was set, will generate a warning.
+# Such missing information will not overwrite any prior iRT data in the database.
+eval(code$gather_target_rt)
+
+# rt_df
+```
+
+```{r}
+# Add the iRT specification to the targets
+# The iRT info is specified as X:Y::Z, where X is the number of the iRT peptide eluting before, y is the number of the PRTC eluting after, and Z is the relative position between these two if 0<=Z<=1
+# Z can also be <0 or >1, if the peptide elutes before or after all available iRT peptides.
+eval(code$calc_irt_specification)
+
+# rt_df
+```
+
+# Submit the data
+
+```{r}
+# Read in all optimization data, write the new data in, and save everything again, by writing all the relevant tables in `opt_folder`
+# A backup of the old data is stored in `opt_folder`/bkp/
+eval(code$read_opt_data)
+eval(code$merge_new_opt_data)
+eval(code$write_out_opt_data)
+
+# opt_data_df
+# opt_data_new_df
+```
+
+```{r include=FALSE}
+cat0("Finished: ", date(), "\n")
+```

@@ -1,0 +1,1710 @@
+---
+title: "Report for PRM experiments"
+author: "Jonas D. Förster"
+project:
+  execute-dir: project
+fig-heigth: 3
+fig-width: 7
+format:
+  pdf:
+    pdf-engine: lualatex
+    documentclass: scrartcl
+    include-in-header:
+      - text: "\\AtBeginDocument{\\let\\maketitle\\relax}"
+    papersize: a4 # 8.3 × 11.7 in
+    geometry:
+      # available: 7 x 9.7 in
+      - top=1in
+      - bottom=1in
+      - left=0.65in
+      - right=0.65in
+execute:
+  echo: false
+  include: false
+knitr:
+  opts_chunk:
+    dev: cairo_pdf
+    out.width: 100%
+params:
+  path: '..\dir\subdir'
+  report_tag: '_IP'
+  skip_ms1: false
+---
+
+```{r setup}
+library(conflicted)
+library(here)
+library(fs)
+library(tidyverse)
+library(scales)
+library(ggpp)
+library(MSTargetedWorkflows)
+library(tictools)
+library(patchwork)
+library(yaml)
+library(IsoSpecR)
+conflicts_prefer(
+  dplyr::filter,
+  ggpp::annotate,
+  .quiet = TRUE
+)
+
+theme_base_size = 7
+theme_set(
+  theme_classic(base_size = theme_base_size) +
+  theme(
+    plot.title = element_text(face = "bold", size = rel(16/14)),
+    axis.title = element_text(size = rel(1)),
+    legend.title = element_text(size = rel(1)),
+    legend.text = element_text(size = rel(0.8)),
+    legend.key.width = unit(1.1, "char"),
+    legend.key.height = unit(0.6, "char"),
+    legend.background = element_rect(fill = "transparent"), # legend bg
+    legend.box.background = element_rect(fill = scales::alpha("white", 0.7), colour = NA), # legend panel bg
+    legend.key = element_rect(fill = "transparent", colour = NA) # legend key bg
+  )
+)
+###############################
+update_geom_defaults("text", list(size = 1))
+#################################
+theme_facetgrid <- theme(panel.border = element_rect(fill = NA, color = "grey85", linewidth = 1))
+
+agc_max <- 5e6
+
+num_sci <- scales::scientific
+num_dec2 <- partial(format, digits = 2, nsmall = 2)
+rm_all_except <- function(...) {
+  except <- map_chr(enquos(...), rlang::as_name)
+  vars <- ls(name = parent.frame())
+  rm(list = vars[!(vars %in% except)], envir = parent.frame())
+}
+```
+
+```{r}
+# fix because quarto doesn't seem to want to hand over boolean params correctly
+skip_ms1 <- read_yaml(text = as.character(params$skip_ms1))
+```
+
+```{r}
+info_def <- tribble(
+  ~param,            ~default,             ~transform,
+  "ms_date",         NA_character_,        as.Date,
+  "prep_date",       NA_character_,        as.Date,
+  "prep_tag",        NA_character_,        as.character,
+  "ip_date",         NA_character_,        as.Date,
+  "ip_tag",          NA_character_,        as.character,
+  "filename",        NULL,                 function(x) str_remove(x, "\\.raw$"),
+  "file_base_path",  "E:/OE Raw data",     as.character,
+  "title",           NA_character_,        as.character,
+  "comments",        "",                   as.character,
+  "cells",           NA_character_,        as.character,
+  "cell_count",      NA_real_,             as.numeric,
+  "ab",              NA_character_,        as.character,
+  "detergent",       NA_character_,        as.character,
+  "ultrafiltered",   NA,                   as.logical,
+  "desalting",       NA_character_,        as.character,
+  "targets",         NA_character_,        as.character,
+  # "resolution_ms1",  NA_real_,             as.numeric,
+  # "resolution_ms2",  NA_real_,             as.numeric,
+  "ppm",             NA_real_,             as.numeric,
+  "ppm_ms1",         7,                    as.numeric,
+  "SIL_amount",      NA_real_,             as.numeric,
+  "rt_reference_filename", NA_character_,  function(x) str_remove(x, "\\.raw$"),
+  # "max_it",          NA_real_,             as.numeric,
+  # "pre_window",      NA_real_,             as.numeric,
+  # "agc_target",      NA_real_,             as.numeric,
+  "speclib_dirs",      character(),        function(x) str_split_1(x, ","),
+)
+info_worker <- function(param, default, transform, info_data) {
+  if (hasName(info_data, param) && !is.null(info_data[[param]]))
+    transform(info_data[[param]])
+  else if (!is.null(default))
+    default
+  else
+    stop("Essential parameter '", param, "' missing in yaml.")
+}
+
+info_data <- read_yaml(path(params$path, paste0("!PRM_Report_", params$report_tag, ".yaml")))
+
+info <-
+  info_def %>%
+  pmap(info_worker, info_data = info_data) %>%
+  set_names(info_def$param)
+
+info
+```
+
+```{r}
+plot_dim_overwrites <-
+  info_data$plot_dim_overwrites %>%
+  imap(function(dims, compound) {
+    strings <- str_split(dims, pattern = ",\\s?")[[1]]
+    nums <- suppressWarnings(as.numeric(strings))
+    # all 4 nums have to be valid or if not, the initial string for NA nums needs to have been "NA"
+    if (length(nums) == 4 && !all(!is.na(nums) | strings == "NA"))
+      stop("badly formed plot dimension overwrite for compound: '", compound, "'")
+    nums
+  })
+
+plot_dim_overwrites
+```
+
+```{r}
+#| message: false
+
+ms_files <- ensure_names(info$filename)
+
+# here there can only ever be one rawfile
+stopifnot(length(ms_files) == 1)
+
+ms_files_origin <- find_rawfile(ms_files, base_path = info$file_base_path)
+
+failmode <- if (skip_ms1) message else stop
+if (is.na(ms_files_origin)) {
+  failmode("Rawfile not found.")
+} else {
+  message("Rawfile found at: '", ms_files_origin, "'.")
+}
+```
+
+```{r}
+if (!is.na(ms_files_origin)) {
+  gen_header_rds(ms_files_origin, dir = params$path, avoid_regeneration = TRUE)
+  invisible(safely(gen_charges_rds, quiet = TRUE)(ms_files_origin, dir = params$path, avoid_regeneration = TRUE))
+}
+```
+
+```{r}
+ms_headers <- read_extracted_headers_rds(path(params$path, ms_files), minimal = TRUE)
+
+ms_headers_ms1 <- filter(ms_headers, ms_level == 1, scan_mode == "Full")
+ms_headers_ms2 <- filter(ms_headers, ms_level == 2, scan_mode == "Full")
+
+has_ms1 <- nrow(ms_headers_ms1) > 0
+
+max_charge_state <- 8
+
+if (has_ms1)
+  ms_charges <- read_extracted_charges_rds(path(params$path, str_append(ms_files, "_charges")))
+
+ms_headers
+if (has_ms1)
+  ms_charges
+```
+
+```{r}
+ms1_info <-
+  ms_headers_ms1 %>%
+  summarise(across(c(resolution, agc_target), ~ list(unique(.x)))) %>%
+  transpose() %>%
+  first()
+tSIM_info <-
+  ms_headers %>%
+  filter(ms_level == 1, scan_mode == "SIM") %>%
+  summarise(across(c(resolution, agc_target), ~ list(unique(.x)))) %>%
+  transpose() %>%
+  first()
+
+# assume, that the lowest resolution scan is for iRTs and can be ignored here
+filter_irt_scans <- function(df) {
+  df_out <- filter(df, resolution != min(resolution))
+  if (nrow(df_out) > 0) df_out
+  else df
+}
+ms2_info <-
+  ms_headers_ms2 %>%
+  filter_irt_scans() %>%
+  summarise(across(c(resolution, max_it, agc_target, pre_window, nce), ~ list(unique(.x)))) %>%
+  transpose() %>%
+  first()
+
+nce_info <- if (length(ms2_info$nce) > 1) "Various" else paste0(ms2_info$nce)
+
+rt_range <- range(ms_headers$rt)
+```
+
+### PRM Report
+# `r info$title`
+
+|[]()                                  |                                             |                                      |                                             |
+|--------------------------------------|---------------------------------------------|--------------------------------------|---------------------------------------------|
+|**Preparation ID**                    |`r info$prep_date` `r info$prep_tag`         |**IP ID**                             |`r info$ip_date` `r info$ip_tag`             |
+|**Cells**                             |`r info$cells`                               |**Cell Count**                        |`r num_sci(info$cell_count)`                 |
+|**Detergent**                         |`r info$detergent`                           |**Ultrafiltered**                     |`r info$ultrafiltered`                       |
+|**Desalting**                         |`r info$desalting`                           |                                      |                                             |
+|**AB**                                |`r info$ab`                                  |**Targets**                           |`r info$targets`                             |
+|**SIL Amount**                        |`r info$SIL_amount` fmol                     |                                      |                                             |
+|                                      |                                             |                                      |                                             |
+|**MS Date**                           |`r info$ms_date`                             |**Filename**                          |`r str_trunc(ms_files, 28, "center")`        |
+|**Resolution MS1**                    |`r ms1_info$resolution / 1e3`k               |**AGC Target MS1**                    |`r num_sci(ms1_info$agc_target)`             |
+|**Resolution MS2**                    |`r ms2_info$resolution / 1e3`k               |**AGC Target MS2**                    |`r num_sci(ms2_info$agc_target)`             |
+|**Pre. Iso. Win.**                    |`r ms2_info$pre_window`                      |**Max. IT**                           |`r paste0(num_dec2(unique(range(ms2_info$max_it))), collapse = "-")` ms |
+|**Norm. Coll. Energy**                |`r nce_info`                                 |**Extraction PPM**                    |`r paste0("MS2: ", info$ppm, "; MS1: ", info$ppm_ms1)` |
+
+`r info$comments`
+
+```{r}
+id_all_precursors_df <-
+  read_id_all_precursors(path(params$path, "id_all_precursors.csv")) %>%
+  mutate(
+    is_irt = is_irt(seq),
+    .before = locator_peptide
+  )
+
+replicates_df <- distinct(id_all_precursors_df, pick(1:locator_replicate))
+locator_replicate_sample <- filter(replicates_df, filename_noext == info$filename)$locator_replicate
+
+if (!is.na(info$rt_reference_filename)) {
+  if (info$rt_reference_filename == "pre_run") {
+    locator_replicate_rt_reference <-
+      replicates_df %>%
+      arrange(datetime) %>%
+      slice(which(locator_replicate == locator_replicate_sample) - 1) %>%
+      pull(locator_replicate)
+  } else {
+    locator_replicate_rt_reference <- filter(replicates_df, filename_noext == info$rt_reference_filename)$locator_replicate
+  }
+} else {
+  locator_replicate_rt_reference <- NA_character_
+}
+
+rt_ref_precursors_df <- filter(id_all_precursors_df, locator_replicate == locator_replicate_rt_reference)
+id_all_precursors_df <- filter(id_all_precursors_df, locator_replicate == locator_replicate_sample)
+
+if (nrow(id_all_precursors_df) == 0)
+  stop("For the selected rawfile, no results are found in the skyline data.")
+
+irt_sample_precursors_df <-
+  id_all_precursors_df %>%
+  filter(is_irt) %>%
+  select(seq_mod, rt_sample = pre_rt) %>%
+  left_join(rt_ref_precursors_df, by = join_by(seq_mod), relationship = "one-to-one") %>%
+  select(seq_mod, rt_sample, rt_ref = pre_rt) %>%
+  mutate(
+    seq_mod = factor(seq_mod, levels = irt_list$prtc_jptrt_26),
+    rt_shift = rt_ref - rt_sample
+  )
+
+stopifnot(check_df_single_cases(irt_sample_precursors_df, single_case_cols = everything(), by = seq_mod))
+```
+
+```{r}
+approxfun_extrapolating <- function(xref, yref) {
+  has_both <- !is.na(xref) & !is.na(yref)
+  xref <- xref[has_both]
+  yref <- yref[has_both]
+  
+  reflen <- sum(has_both)
+  stopifnot(reflen >= 2)
+  
+  x_sort <- sort.int(xref, index.return = TRUE)$ix
+  xref <- xref[x_sort]
+  yref <- yref[x_sort]
+  
+  dy <- diff(yref) / diff(xref)
+  xref <- head(xref, -1)
+  yref <- head(yref, -1)
+  reflen <- length(xref)
+  
+  function(x) {
+    i <- map_int(x, ~ match(TRUE, xref >= .x)) - 1L
+    i[i == 0L] <- 1L
+    i[is.na(i)] <- reflen
+    yref[i] + dy[i] * (x - xref[i])
+  }
+}
+make_speclib_rt_transformer <- function(sample_rt, speclib_rt) list(
+  sample_to_speclib = approxfun_extrapolating(sample_rt, speclib_rt),
+  speclib_to_sample = approxfun_extrapolating(speclib_rt, sample_rt)
+)
+
+speclibs_available <- FALSE
+if (!is_empty(info$speclib_dirs)) {
+  speclibs_available <- TRUE
+
+  speclib_precursors_df <-
+    info$speclib_dirs %>%
+    set_names() %>%
+    map(~
+      read_id_all_precursors(here(.x, "id_all_precursors.csv")) %>%
+        filter(!is.na(pre_rt)) %>%
+        left_join(
+          read_id_all_transitions(here(.x, "id_all_transitions.csv")),
+          by = join_by(locator_replicate, locator_precursor), relationship = "one-to-many"
+        ) %>%
+        left_join(
+          read_id_all_chromatograms(here(.x, "id_all_chromatograms_ms2_top25.csv")),
+          by = join_by(locator_replicate, locator_transition), relationship = "one-to-one"
+        ) %>%
+        nest(transitions_df = c(locator_precursor:last_col(), -locator_precursor))
+    ) %>%
+    bind_rows(.id = "speclib") %>%
+    mutate(
+      is_irt = is_irt(seq_mod),
+      .after = pre_charge
+    )
+  
+  # create a running id for speclibs
+  speclib_df <-
+    speclib_precursors_df %>%
+    distinct(speclib, locator_replicate) %>%
+    rowid_to_column("speclib_id")
+  
+  speclib_precursors_df <- left_join(speclib_df, speclib_precursors_df, by = join_by(speclib, locator_replicate), relationship = "one-to-many")
+  
+  irt_speclib_rt_df <-
+    speclib_precursors_df %>%
+    filter(is_irt) %>%
+    distinct(speclib_id, seq_mod, rt_speclib = pre_rt) %>%
+    mutate(seq_mod = factor(seq_mod, levels = irt_list$prtc_jptrt_26)) %>%
+    arrange(speclib_id, seq_mod) %>%
+    full_join(
+      mutate(irt_sample_precursors_df, irt_match = TRUE),
+      by = join_by(seq_mod), relationship = "many-to-one"
+    ) %>%
+    replace_na(list(irt_match = FALSE))
+  
+  irt_speclib_rt_df %>%
+    summarise(.by = speclib_id, n = sum(irt_match)) %>%
+    filter(n < 2) %>%
+    pull(speclib_id) %>%
+    walk(\(id) stop(call. = FALSE,
+      "Speclib ", id, ": '" , speclib_df$speclib[id], "' : '", speclib_df$locator_replicate[id],
+      "' is incompatible due to no iRT matching with the sample."
+    ))
+  
+  irt_speclib_rt_df <- select(irt_speclib_rt_df, -irt_match)
+  
+  speclibs <-
+    speclib_df %>%
+    left_join(
+      nest(irt_speclib_rt_df, rt_df = -speclib_id),
+      by = join_by(speclib_id), relationship = "one-to-many"
+    ) %>%
+    rowwise() %>%
+    mutate(speclib_rt_transformer = list(make_speclib_rt_transformer(rt_df$rt_sample, rt_df$rt_speclib))) %>%
+    nest(data = c(-speclib_id)) %>%
+    deframe() %>%
+    map(single_row_df_to_list)
+  
+  # only keep the first reference chromatogram per precursor
+  # speclib_chromatograms_df <- semi_join(
+  #   speclib_chromatograms_df,
+  #   distinct(speclib_chromatograms_df, seq_mod, pre_charge, .keep_all = TRUE),
+  #   by = join_by(speclib_id, seq_mod, pre_charge)
+  # )
+}
+```
+
+```{r}
+rt_range_for_speclibs <- range(id_all_precursors_df$pre_rt, na.rm = TRUE)
+
+rt_range_for_speclibs
+```
+
+```{r}
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  left_join(
+    read_id_all_transitions(path(params$path, "id_all_transitions.csv")),
+    by = join_by(locator_replicate, locator_precursor), relationship = "one-to-many"
+  ) %>%
+  left_join(
+    read_id_all_chromatograms(path(params$path, "id_all_chromatograms.csv")),
+    by = join_by(locator_replicate, locator_transition), relationship = "one-to-one"
+  ) %>%
+  nest(transitions_df = c(locator_precursor:last_col(), -locator_precursor))
+  
+id_all_precursors_df
+```
+
+## MS overview
+
+```{r}
+#| include: true
+#| fig-height: 3
+
+if (has_ms1) {
+  z_too_much <- 5
+  
+  # integrate the intensity on a per charge state basis
+  charges_i_sum_df <-
+    tibble(charge = sort(unique(ms_charges$charge), na.last = TRUE)) %>%
+    # we need to expand to all charge states at all time points so we can fill missing data with 0
+    cross_join(distinct(ms_charges, scan_number, rt)) %>%
+    left_join(select(ms_charges, charge, scan_number, intensity), by = join_by(charge, scan_number), relationship = "one-to-one") %>%
+    replace_na(list(intensity = 0)) %>%
+    summarise(.by = charge, i_sum = integrate_timeseries(rt, intensity))
+
+  # charge state NA is TIC
+  i_total <- filter(charges_i_sum_df, is.na(charge))$i_sum
+  i_2_3 <- sum(filter(charges_i_sum_df, charge >= 2, charge <= 3)$i_sum)
+  i_too_much <- sum(filter(charges_i_sum_df, charge >= z_too_much)$i_sum)
+
+  tic_charges_plot <-
+    plot_charge_data_ggunipoly(ms_charges, max_charge = 8)$plot +
+    scale_x_continuous(breaks = scales::breaks_extended(n = 11)) +
+    coord_cartesian(xlim = rt_range) +
+    annotate("text_npc", npcx = 1, npcy = 1, label = paste0("i (2-3): ", num_sci(i_2_3, digits = 2), "\ni (> ", z_too_much - 1, "): ", num_sci(i_too_much, digits = 2)), hjust = 1, vjust = 1, size = 2) +
+    labs(x = "Retention Time (min)", y = "Total Ion Current (a.u.)", fill = "Charge State")
+  
+  tic_charges_plot
+}
+```
+
+```{r}
+#| include: true
+#| fig-height: 3
+
+if (has_ms1) {
+  max_agc_target <- 1
+  it_scaling_factor <- 1
+  
+  if (nrow(ms_headers_ms1) > 0) {
+    max_agc_target <- max(ms_headers_ms1$agc_target)
+    it_scaling_factor <- max_agc_target / max(ms_headers_ms1$max_it)
+  }
+  
+  ms_headers_ms1 %>%
+    ggplot(aes(x = rt)) +
+    geom_step(aes(y = agc_fill * agc_target), color = "black", direction = "vh") +
+    geom_step(aes(y = it * it_scaling_factor), color = "blue", direction = "vh") +
+    geom_hline(yintercept = max_agc_target, color = "red") +
+    scale_x_continuous(breaks = scales::breaks_extended(n = 11)) +
+    scale_y_continuous(
+      labels = scales::scientific,
+      sec.axis = sec_axis(
+        trans = ~ . / it_scaling_factor,
+        name = "Injection Time (ms)"
+      )
+    ) +
+    coord_cartesian(xlim = rt_range) +
+    labs(x = "Retention Time (min)", y = "est. AGC Chrg. (#)", title = "Full Ms AGC Overview") +
+    theme(
+      panel.grid.major.y = element_line(color = "grey90"),
+      axis.ticks.y.right = element_line(color = "blue"),
+      axis.text.y.right = element_text(color = "blue"),
+      axis.title.y.right = element_text(color = "blue")
+    )
+}
+```
+
+```{r}
+#| include: true
+#| fig-height: 1.5
+
+if (any(!is.na(irt_sample_precursors_df$rt_shift))) {
+  rt_shift_mark <- irt_sample_precursors_df$rt_shift[which.max(abs(irt_sample_precursors_df$rt_shift))]
+  rt_shift_label <- paste0("Max RT shift vs reference: ", num_dec2(rt_shift_mark), " min")
+} else {
+  rt_shift_mark <- 
+    approx(x = ms_headers$rt, y = ms_headers$rt_shift, xout = seq(rt_range[1], rt_range[2], length.out = 1e6), method = "constant", f = 0)$y %>%
+    quantile(probs = 0.98, na.rm = TRUE)
+  rt_shift_label <- paste0("RT shift 98th percentile: ", num_dec2(rt_shift_mark), " min")
+}
+
+rt_shift_sign <- if (rt_shift_mark >= 0) 1 else -1
+
+ms_headers %>%
+  ggplot(aes(x = rt, y = rt_shift)) +
+  geom_hline(yintercept = 0, color = "grey50") +
+  geom_vline(data = irt_sample_precursors_df, aes(xintercept = rt_sample), color = "orange", linetype = 2, na.rm = TRUE) +
+  geom_hline(yintercept = rt_shift_mark, color = "red", linetype = 2) +
+  annotate("text", x = rt_range[2], y = rt_shift_mark, label = rt_shift_label, hjust = 1, vjust = 1.3 * rt_shift_sign, size = 2) +
+  geom_line(data = irt_sample_precursors_df, aes(x = rt_sample), color = "green", na.rm = TRUE) +
+  geom_point(data = irt_sample_precursors_df, aes(x = rt_sample), color = "green", shape = 1, na.rm = TRUE) +
+  geom_step(direction = "vh", alpha = 0.7) +
+  annotate("text_npc", label = paste0("vs ", info$rt_reference_filename, "  "), npcx = 1, hjust = 1, npcy = 1, vjust = 1.2, size = 2) +
+  scale_x_continuous(breaks = scales::breaks_extended(n = 11)) +
+  coord_cartesian(xlim = rt_range) +
+  labs(x = "Retention Time (min)", y = "RT shift (min)", title = "Dynamic RT shift control", subtitle = "Pos. value means shift towards early elution")
+```
+
+```{r}
+#| include: true
+#| fig-height: 1.5
+
+ms_headers %>%
+  mutate(lm_found = lm_found_count > 0) %>%
+  ggplot(aes(x = rt, y = lm_mz_corr, color = lm_found)) +
+  facet_grid(rows = vars(`Scan Type` = scan_type), scales = "free_y") +
+  geom_hline(yintercept = 0, color = "black", alpha = 0.3) +
+  geom_step(direction = "vh", group = FALSE) +
+  geom_point(data = function(x) filter(x, lm_found), size = 0.5) +
+  scale_x_continuous(breaks = scales::breaks_extended(n = 11)) +
+  scale_color_manual(values = c("red", "black")) +
+  coord_cartesian(xlim = rt_range) +
+  labs(x = "Retention Time (min)", y = "LM correction (ppm)", color = "LM found", title = "Lock mass correction") +
+  theme(legend.position = "top") +
+  theme_facetgrid
+```
+
+```{r}
+#| include: true
+#| fig-height: 3
+
+fill_plot <-
+  ms_headers %>%
+  ggplot(aes(x = rt, y = tic * it / 1000)) +
+  facet_grid(rows = vars(`Scan Type` = scan_type), scales = "free_y") +
+  geom_step(aes(y = agc_max), color = "red", direction = "vh") +
+  # geom_point(aes(y = agc_target * agc_fill), color = "green") +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), se = FALSE) +
+  # geom_point_rast(aes(y = tic * it / 1000), alpha = 0.1, raster.height = 1.5) +
+  scale_x_continuous(breaks = scales::breaks_extended(n = 11)) +
+  scale_y_continuous(labels = scales::scientific) +
+  coord_cartesian(xlim = rt_range) +
+  labs(x = "Retention Time (min)", y = "Scan Charges (#)", title = "Orbitrap filling control") +
+  theme_facetgrid
+
+fill_plot
+```
+
+```{r}
+#| include: true
+#| fig-height: 3
+
+agc_error_plot <-
+  ms_headers %>%
+  ggplot(aes(x = rt, y = tic * it / 1000 / (agc_fill * agc_target))) +
+  facet_grid(rows = vars(`Scan Type` = scan_type), scales = "free_y") +
+  geom_hline(yintercept = 1, color = "red") +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), se = FALSE) +
+  # geom_point_rast(aes(y = tic * it / 1000), alpha = 0.1, raster.height = 1.5) +
+  scale_x_continuous(breaks = scales::breaks_extended(n = 11)) +
+  scale_y_log10() +
+  coord_cartesian(xlim = rt_range) +
+  annotation_logticks(sides = "l") +
+  labs(x = "Retention Time (min)", y = "Scan TIC / AGC estimate", title = "AGC accurracy") +
+  theme_facetgrid
+
+agc_error_plot
+```
+
+## Spectral Libraries
+
+```{r}
+#| include: true
+#| fig-height: 3
+
+make_speclib_rt_plot <- function(speclib_id) {
+  speclib <- speclibs[[speclib_id]]
+  
+  rt_trans <- speclib$speclib_rt_transformer$sample_to_speclib
+  
+  tibble(x = seq(rt_range_for_speclibs[1], rt_range_for_speclibs[2], by = 0.05)) %>%
+    ggplot(aes(x, rt_trans(x))) +
+    geom_abline(slope = 1, intercept = 0, color = "black", alpha = 0.3) +
+    geom_line() +
+    geom_point(data = speclib$rt_df, aes(x = rt_sample, y = rt_speclib), color = "red", shape = 1, na.rm = TRUE) +
+    scale_x_continuous(breaks = scales::breaks_extended(n = 6)) +
+    coord_cartesian(xlim = rt_range) +
+    labs(x = "RT Sample (min)", y = "RT Spectral Library (min)", title = paste(speclib$speclib, speclib$filename, sep = "\n"))
+}
+
+if (speclibs_available) {
+  speclib_count <- length(speclibs)
+  
+  # print in two columns
+  for (i in seq(1, speclib_count, by = 2)) {
+    plot_left <- make_speclib_rt_plot(i)
+    if (i < speclib_count) {
+      plot_right <- make_speclib_rt_plot(i + 1)
+    } else {
+      plot_right <- NULL
+    }
+    
+    print(plot_left + plot_right + plot_layout(nrow = 1))
+  }
+}
+```
+
+```{r}
+#| include: true
+#| fig-height: 1.3
+
+make_speclib_rt_delta_plot <- function(speclib_id) {
+  speclib <- speclibs[[speclib_id]]
+  
+  rt_trans <- speclib$speclib_rt_transformer$sample_to_speclib
+  
+  tibble(x = seq(rt_range_for_speclibs[1], rt_range_for_speclibs[2], by = 0.05)) %>%
+    ggplot(aes(x, rt_trans(x) - x)) +
+    geom_hline(yintercept = 0, color = "black", alpha = 0.3) +
+    geom_line() +
+    geom_point(data = speclib$rt_df, aes(x = rt_sample, y = rt_speclib - rt_sample), color = "red", shape = 1, na.rm = TRUE) +
+    scale_x_continuous(breaks = scales::breaks_extended(n = 11)) +
+    coord_cartesian(xlim = rt_range) +
+    labs(x = "RT Sample (min)", y = "ΔRT Spectral Library (min)", title = paste(speclib$speclib, speclib$filename, sep = "\n"), subtitle = "Pos. value means shift towards early elution")
+}
+
+if (speclibs_available) {
+  for (i in 1:speclib_count)
+    print(make_speclib_rt_delta_plot(i))
+}
+```
+
+## Peptides
+
+```{r}
+# figure out if there are any heavy/light pairs in the data
+precursor_heavy_and_light_df <-
+  id_all_precursors_df %>%
+  summarise(.by = locator_precursor_nohl, has_heavy_and_light = all(c(FALSE, TRUE) %in% is_heavy)) %>%
+  filter(has_heavy_and_light)
+
+heavy_as_speclib_precursors_df <-
+  id_all_precursors_df %>%
+  semi_join(precursor_heavy_and_light_df, join_by(locator_precursor_nohl)) %>%
+  filter(is_heavy)
+
+id_all_precursors_df <- anti_join(id_all_precursors_df, heavy_as_speclib_precursors_df, join_by(locator_precursor))
+
+# if there is a heavy/light combination, we don't need the speclib
+if (speclibs_available) {
+  speclib_precursors_df <- bind_rows(
+    speclib_precursors_df[integer(), ],
+    heavy_as_speclib_precursors_df,
+    speclib_precursors_df
+  )
+} else {
+  speclib_precursors_df <- mutate(heavy_as_speclib_precursors_df, speclib_id = NA_integer_, speclib = NA_character_, .before = 1)
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  left_join(
+    speclib_precursors_df %>%
+      nest(speclib_precursor = c(-speclib_id, -speclib, -seq_mod, -pre_charge)) %>%
+      # these should all be length one so can be transformed from df to list for easier access
+      mutate(speclib_precursor = map(speclib_precursor, single_row_df_to_list)),
+    join_by(seq_mod, pre_charge),
+    multiple = "first",
+    relationship = "many-to-one"
+  ) %>%
+  mutate(has_speclib = !map_lgl(speclib_precursor, is.null), .before = speclib_id) %>%
+  mutate(seq_plot_title = paste0(seq_mod_3letter, str_dup("+", pre_charge)), .before = locator_precursor_nohl)
+
+id_all_precursors_df
+```
+
+```{r}
+# range plus X perc in each direction
+range_plus_Xperc <- function(..., percent = 10) {
+  range <- range(...)
+  range + (c(-1, 1) * diff(range) * percent / 100)
+}
+
+# make rt lims for the plots
+# do 25% buffer on both sides of the peak but at least 1.25 minutes window
+# ensure that the speclib rt is within the range
+make_plot_rt_lims <- function(seq_plot_title, pre_rt_min, pre_rt_max, has_speclib, speclib_id, speclib_precursor, transitions_df, min_range = 1.25, max_range_lib_only = 6, align_speclib = TRUE) {
+  rt_lims <- c(NA_real_, NA_real_)
+  rt_lib <- NA_real_
+  
+  if (has_speclib) {
+    rt_lib <- speclib_precursor$pre_rt
+    
+    if (!is.na(speclib_id) & align_speclib)
+      rt_lib <- speclibs[[speclib_id]]$speclib_rt_transformer$speclib_to_sample(rt_lib)
+    # else, it is a heavy / light pairing
+  }
+  
+  if (!is.na(pre_rt_max) && !is.na(pre_rt_min)) {
+  # if we have a detection, center around that but also ensure reference is included
+    rt_lims <- range(pre_rt_max, pre_rt_min, rt_lib, na.rm = TRUE)
+    diff <- diff(rt_lims)
+    # add a little buffer, more to the right because of the legend
+    rt_lims <- rt_lims + diff * c(-0.15, 0.4)
+    if (diff(rt_lims) < min_range)
+      rt_lims <- mean(rt_lims) + min_range / 2 * c(-1, 1)
+  } else {
+    # if we have no detection, extract the range of the acquired chromatogram
+    rt_lims <-
+      transitions_df %>%
+      filter(scan_type == "Full Ms2") %>%
+      pull(chromatogram_df) %>%
+      map("rt") %>%
+      flatten_dbl() %>%
+      range()
+    
+    # if we have a lib, we need it included
+    if (has_speclib & !is.na(rt_lib)) {
+      if (rt_lib < rt_lims[1]) {
+        # go right from lib
+        # use a compromise that includes the lib and won't go super far off away from the lib
+        rt_lims <- c(rt_lib, min(rt_lims[2], rt_lib + max_range_lib_only))
+      } else if (rt_lib > rt_lims[2]) {
+        # go left from lib
+        # use a compromise that includes the lib and won't go super far off away from the lib
+        rt_range <- min(rt_lib - rt_lims[1], max_range_lib_only)
+        # further shift a little to the right so the lib doesn't end up in the legend too much
+        rt_lib <- rt_lib + rt_range * 0.35
+        rt_lims <- c(rt_lib - rt_range, rt_lib)
+      } else {
+        # ensure that the lib doesn't end up in the legend too much
+        rt_range <- diff(rt_lims)
+        rt_lims <- range(rt_lims, rt_lib + rt_range * 0.35)
+      }
+    }
+  }
+  
+  if (seq_plot_title %in% names(plot_dim_overwrites)) {
+    plot_dim_overwrite <- plot_dim_overwrites[[seq_plot_title]]
+    if (!is.na(plot_dim_overwrite[1])) rt_lims[1] <- plot_dim_overwrite[1]
+    if (!is.na(plot_dim_overwrite[2])) rt_lims[2] <- plot_dim_overwrite[2]
+  }
+  
+  stopifnot(!anyNA(rt_lims))
+  
+  rt_lims
+}
+
+make_plot_i_lims <- function(seq_plot_title, pre_rt_min, pre_rt_max, transitions_df) {
+  i_lims <- c(NA_real_, NA_real_)
+  if (!is.na(pre_rt_max) && !is.na(pre_rt_min)) {
+    i_max <-
+      transitions_df %>%
+      filter(scan_type == "Full Ms2", transition_is_quantitative) %>%
+      pull(chromatogram_df) %>%
+      bind_rows() %>%
+      # add a small buffer (300 ms) just to not cut too eagerly
+      filter(between(rt, pre_rt_min - 0.005, pre_rt_max + 0.005)) %>%
+      pull(i) %>%
+      max()
+    
+    i_lims[2] <- i_max
+  }
+  
+  if (seq_plot_title %in% names(plot_dim_overwrites)) {
+    plot_dim_overwrite <- plot_dim_overwrites[[seq_plot_title]]
+    if (!is.na(plot_dim_overwrite[3])) i_lims[2] <- plot_dim_overwrite[3]
+    if (!is.na(plot_dim_overwrite[4])) i_lims[1] <- -plot_dim_overwrite[4]
+  }
+  i_lims
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(
+    plot_rt_lims = list(make_plot_rt_lims(seq_plot_title, pre_rt_min, pre_rt_max, has_speclib, speclib_id, speclib_precursor, transitions_df, align_speclib = TRUE)),
+    plot_rt_lims_unaligned = list(make_plot_rt_lims(seq_plot_title, pre_rt_min, pre_rt_max, has_speclib, speclib_id, speclib_precursor, transitions_df, align_speclib = FALSE)),
+    plot_i_lims = list(make_plot_i_lims(seq_plot_title, pre_rt_min, pre_rt_max, transitions_df))
+  ) %>%
+  ungroup()
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(plot_rt_lims) %>%
+#   walk(print)
+# 
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(plot_i_lims) %>%
+#   walk(print)
+```
+
+```{r}
+# make rt lims for the plots
+# do 25% buffer on both sides of the peak but at least 1.25 minutes window
+# ensure that the speclib rt is within the range
+make_dotp_selfmade <- function(transitions_df) {
+  dotp_selfmade <-
+    transitions_df %>%
+    filter(transition_is_quantitative) %>%
+    {calc_nsca(.$transition_i, .$transition_i_lib)}
+  
+  if (is.na(dotp_selfmade))
+    dotp_selfmade <- 0
+  
+  dotp_selfmade
+}
+
+id_all_precursors_df <- mutate(id_all_precursors_df, dotp_selfmade = map_dbl(transitions_df, make_dotp_selfmade))
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   select(dotp, dotp_selfmade)
+```
+
+```{r}
+make_ms2_scan_numbers <- function(transitions_df) {
+  transitions_df %>%
+    filter(scan_type == "Full Ms2") %>%
+    select(chromatogram_df) %>%
+    unnest(chromatogram_df) %>%
+    pull(scan_number) %>%
+    unique() %>%
+    sort()
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(ms2_scan_numbers = list(make_ms2_scan_numbers(transitions_df))) %>%
+  ungroup()
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(ms2_scan_numbers) %>%
+#   walk(print)
+```
+
+```{r}
+make_nces <- function(ms2_scan_numbers) {
+  ms_headers_ms2 %>%
+    select(scan_number, nce) %>%
+    filter(scan_number %in% ms2_scan_numbers) %>%
+    pull(nce) %>%
+    unique()
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(nces = list(make_nces(ms2_scan_numbers))) %>%
+  ungroup()
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(nces) %>%
+#   walk(print)
+```
+
+```{r}
+#| include: true
+#| fig-height: 1.3
+
+dotp_target <- 0.85
+dotp_col_count <- 34L
+
+dotp_plot_df <-
+  id_all_precursors_df %>%
+  mutate(has_multi_charge = n_distinct(pre_charge) > 1, .by = locator_peptide) %>%
+  mutate(has_multi_hl = n_distinct(is_heavy) > 1, .by = locator_precursor_nohl) %>%
+  mutate(
+    compound = paste0(seq_mod_3letter, str_dup("+", ifelse(has_multi_charge, pre_charge, 0))),
+    detected = dotp_selfmade >= dotp_target,
+    detected_label = factor(detected, levels = TRUE, labels = "detected")
+  ) %>%
+  select(filename:is_heavy, area_ms1:locator_precursor, speclib, dotp_selfmade, has_multi_charge:detected_label)
+
+labels_precursor_nohl <- deframe(distinct(dotp_plot_df, locator_precursor_nohl, compound))
+
+dotp_plots <-
+  dotp_plot_df %>%
+  filter(!has_multi_hl | !is_heavy) %>%
+  group_by(locator_protein, protein) %>%
+  mutate(n = (unclass(fct_drop(locator_precursor_nohl)) - 1) %/% dotp_col_count) %>%
+  group_by(n, .add = TRUE) %>%
+  group_map(function(data, grouping) {
+    n_count <- n_distinct(data$compound)
+    n_start <- grouping$n * dotp_col_count + 1
+    
+    title <- paste0(grouping$protein, " (", n_start, "-", n_start + n_count - 1, ")")
+    
+    data %>%
+      ggplot(aes(x = locator_precursor_nohl, y = 1)) +
+      geom_tile(aes(fill = dotp_selfmade), width = 1, height = 1) +
+      geom_text(aes(color = detected_label), label = "\u2022", size = 3) +
+      scale_x_discrete(labels = labels_precursor_nohl, drop = TRUE, position = "top") +
+      scale_y_continuous(breaks = NULL) +
+      scale_color_manual(values = c(detected = "red"), na.translate = FALSE, drop = FALSE) +
+      scale_fill_viridis_c(limits = c(0, 1)) +
+      coord_fixed(expand = FALSE, xlim = c(0.5, dotp_col_count + 0.5), ylim = c(0.5, 1.5)) +
+      labs(x = NULL, y = title, color = "Indication", fill = "NSA") +
+      theme(
+        legend.justification = c(0, 0),
+        axis.text.x = element_text(angle = 45, vjust = 0, hjust = 0),
+        axis.text.y = element_text(angle = 90, hjust = 0),
+        axis.line = element_blank()
+      )
+  })
+
+walk(dotp_plots, print)
+```
+
+```{r}
+#| include: true
+#| fig-height: 9.7
+
+plot_overview_df <-
+  id_all_precursors_df %>%
+  group_by(locator_protein, protein) %>%
+  group_modify(function(data, group) {
+    plot_data <-
+      data %>%
+      unnest(transitions_df) %>%
+      filter(scan_type == "Full Ms2") %>%
+      select(locator_precursor, pre_rt_min, pre_rt_max, chromatogram_df) %>%
+      unnest(chromatogram_df) %>%
+      mutate(i = if_else(rt >= pre_rt_min - 0.005 & rt <= pre_rt_max + 0.005, i, 0, 0)) %>%
+      summarise(.by = c(locator_precursor, rt), i = sum(i))
+    
+    plot <-
+      plot_data %>%
+      ggplot(aes(x = rt, y = i, color = locator_precursor, fill = locator_precursor)) +
+      geom_hline(yintercept = 0) +
+      geom_area(linetype = 0, alpha = 0.3, position = "identity") +
+      geom_line() +
+      scale_fill_discrete(guide = "none") +
+      scale_color_discrete(guide = "none") +
+      coord_cartesian(xlim = rt_range) +
+      labs(x = "Retention time (min)", y = "Intensity (a.u.)", fill = "Sequence", title = group$protein) +
+      theme(legend.position = "top")
+    
+    tibble(plot = list(plot))
+  })
+
+wrap_plots(plot_overview_df$plot, ncol = 1, guides = "keep")
+```
+
+```{r}
+data("isotopicData", package = "IsoSpecR")
+# add data for our SIL labelled AA
+isotope_data <-
+  isotopicData$IsoSpec %>%
+  mutate(isotope = as.character(isotope)) %>%
+  add_row(element = "C'", isotope = "C'", mass = filter(., isotope == "C13")$mass, abundance = 1) %>%
+  add_row(element = "N'", isotope = "N'", mass = filter(., isotope == "N15")$mass, abundance = 1)
+
+make_isotopic_envelope <- function(pre_mz, pre_charge, pre_formula) {
+  formula_split <- str_match_all(pre_formula, "([^\\d]'?)(\\d*)")[[1]]
+  formula_isospec <-
+    formula_split[, 3] %>%
+    as.numeric() %>%
+    replace(is.na(.), 1) %>%
+    set_names(formula_split[, 2])
+  
+  isotope_df <-
+    formula_isospec %>%
+    IsoSpecify(stopCondition = 0.9999, isotopes = isotope_data) %>%
+    as_tibble() %>%
+    mutate(mz = mass / pre_charge) %>%
+    arrange(desc(prob)) %>%
+    rowid_to_column("n") %>%
+    mutate(mass_offset = round((mz - pre_mz) * pre_charge))
+  
+  match_similar_mz <- function(mz, n) {
+        if (n > 3) return(tibble())
+        mz_select <- mz
+
+        isotope_df %>%
+          filter(abs(mz - mz_select) <= (mz_select / 1e6 * info$ppm_ms1)) %>%
+          summarise(prob_sum = sum(prob), mz_avg = weighted.mean(mz, prob))
+  }
+  
+  major_matched_df <-
+    isotope_df %>%
+    group_by(mass_offset) %>%
+    slice(1) %>%
+    ungroup() %>%
+    filter(mass_offset %in% c(0:2)) %>%
+    rowwise(n) %>%
+    reframe(match_similar_mz(mz, n))
+  
+  left_join(isotope_df, major_matched_df, by = join_by(n), relationship = "one-to-one")
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(isotopic_envelope = list(make_isotopic_envelope(pre_mz, pre_charge, pre_formula))) %>%
+  ungroup()
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(isotopic_envelope) %>%
+#   walk(print)
+```
+
+```{r}
+if (!skip_ms1 && has_ms1) {
+  library(MsRawAccess)
+  
+  fill_ms1_scans <- function(df, grouping) {
+    # all NA i values of type logical is an error that I found stemming from corrupted rawfiles
+    stopifnot(is.numeric(df$i))
+    ms_headers_ms1 %>%
+      select(scan_number, rt) %>%
+      left_join(df, by = join_by(scan_number), relationship = "one-to-many") %>%
+      replace_na(list(i = 0))
+  }
+  
+  ms1_data <-
+    id_all_precursors_df %>%
+    select(locator_precursor, plot_rt_lims, plot_rt_lims_unaligned, isotopic_envelope) %>%
+    # take the combined range from both relevant limits to not cut any relevant data later
+    mutate(rt_lims = map2(plot_rt_lims, plot_rt_lims_unaligned, \(...) range_plus_Xperc(..., percent = 10))) %>%
+    hoist(rt_lims, rt_min = 1, rt_max = 2) %>%
+    unnest(isotopic_envelope) %>%
+    filter(!is.na(mz_avg)) %>%
+    select(locator_precursor, rt_min, rt_max, mass_offset, prob_sum, mz_avg) %>%
+    mutate(ms1_xic = extract_ms1_xic(ms_files_origin, ions = mz_avg, tol = info$ppm_ms1, tol_mode = "ppm")) %>%
+    unnest_wider(ms1_xic) %>%
+    select(-Ion, -MZs, -Errors, scan_number = ScanNumbers, i = Intensities) %>%
+    unchop(c(scan_number, i)) %>%
+    group_by(across(c(-scan_number, -i))) %>%
+    group_modify(fill_ms1_scans) %>%
+    ungroup() %>%
+    filter(rt >= rt_min, rt <= rt_max) %>%
+    select(-rt_min, -rt_max) %>%
+    nest(data = -locator_precursor) %>%
+    deframe()
+
+  make_ms1_dotp <- function(locator_precursor, pre_rt_min, pre_rt_max) {
+    if (is.na(pre_rt_min) || is.na(pre_rt_max))
+      return(NA_real_)
+    
+    ms1_data_df <- ms1_data[[as.character(locator_precursor)]]
+    
+    isotope_df <- summarise(ms1_data_df, .by = c(mass_offset, prob_sum), i = integrate_timeseries(rt, i, c(pre_rt_min, pre_rt_max)))
+    
+    if (all(isotope_df$i == 0))
+      return(0)
+    
+    calc_nsca(isotope_df$prob_sum, isotope_df$i)
+  }
+  
+  id_all_precursors_df <-
+    id_all_precursors_df %>%
+    rowwise(everything()) %>%
+    mutate(idotp_selfmade = list(make_ms1_dotp(locator_precursor, pre_rt_min, pre_rt_max))) %>%
+    ungroup()
+} else {
+  id_all_precursors_df$idotp_selfmade <- NA_real_
+}
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(idotp_selfmade) %>%
+#   walk(print)
+```
+
+```{r}
+make_seq_coverage_generator <- function(seq_mod_3letter, seq_mod_sil, pre_charge, transitions_df) {
+  force(seq_mod_3letter)
+  force(pre_charge)
+  
+  seq_label_finder <- str_replace_all(seq_mod_sil, "[A-Z]\\[Label:.*?\\]", "_")
+  label_positions <- str_locate_all(seq_label_finder, coll("_"))[[1]][, 1]
+  rm(seq_label_finder)
+  
+  transitions_df <- filter(transitions_df, scan_type == "Full Ms2", transition_i + transition_i_bg > 0)
+  transition_types <- transitions_df$transition_type
+  transition_ordinals <- transitions_df$transition_ordinal
+  rm(transitions_df)
+  
+  partial(plot_peptide_sequence_coverage,
+    sequence = seq_mod_3letter,
+    pre_charge = pre_charge,
+    transition_types = transition_types,
+    transition_ordinals = transition_ordinals,
+    underscore_positions = label_positions
+  )
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(seq_coverage_generator = list(make_seq_coverage_generator(seq_mod_3letter, seq_mod_sil, pre_charge, transitions_df))) %>%
+  ungroup()
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(seq_coverage_generator) %>%
+#   walk(~ print(.x()))
+```
+
+```{r}
+make_plot_header_generator <- function(seq_coverage_generator, protein, pre_mz, nces, dotp_selfmade, rdotp, idotp_selfmade) {
+  force(seq_coverage_generator)
+  force(protein)
+  pre_mz <- num_dec2(pre_mz)
+  force(nces)
+  dotp_selfmade <- num_dec2(dotp_selfmade)
+  rdotp <- num_dec2(rdotp)
+  idotp_selfmade <- num_dec2(idotp_selfmade)
+  
+  function(fontsize = 2.3, fontsize_main_factor = 1.3, ...) {
+    lineheight <- 0.9
+  
+    seq_coverage_generator(fontsize = fontsize * fontsize_main_factor, ...) +
+    annotate("text_npc", label = protein, npcx = 0, npcy = 1, hjust = 0, vjust = 1, size = fontsize, lineheight = lineheight) +
+    annotate("text_npc", npcx = 1, npcy = 1, hjust = 1, vjust = 1, size = fontsize, lineheight = lineheight,
+      label = paste0(
+        "NSA: ", dotp_selfmade, " | rdotp: ", rdotp, " | idotp: ", idotp_selfmade, "\n",
+        "m/z: ", pre_mz, "\n",
+        "NCE: ", paste0(nces, collapse = "%, "), "%"
+      )
+    )
+  }
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(plot_header_generator = list(make_plot_header_generator(seq_coverage_generator, protein, pre_mz, nces, dotp_selfmade, rdotp, idotp_selfmade))) %>%
+  ungroup()
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(plot_header_generator) %>%
+#   walk(~ print(.x()))
+```
+
+```{r fig.height=0.34, fig.width=3.5}
+make_plot_header <- function(plot_header_generator) {
+  plot_header_generator(width = 3.5, height = 0.34, units = "in", fontsize = 2.3, fontsize_main_factor = 1.15, vjust = 1)
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(plot_header = list(make_plot_header(plot_header_generator))) %>%
+  ungroup()
+
+id_all_precursors_df %>%
+  sample_n(5) %>%
+  pull(plot_header) %>%
+  walk(print)
+```
+
+```{r}
+make_plot_isotopes <- function(pre_mz, ms2_scan_numbers, isotopic_envelope) {
+  as.list(environment()) # ensure that everything is evaluated and nothing refers back to the global env
+  
+  mz_window_edges <-
+    ms_headers_ms2 %>%
+    select(scan_number, pre_mz, pre_window, pre_window_offset) %>%
+    filter(scan_number %in% ms2_scan_numbers) %>%
+    unchop(pre_mz) %>%
+    mutate(
+      mz_start = pre_mz + pre_window_offset - (pre_window / 2),
+      mz_stop = pre_mz + pre_window_offset + (pre_window / 2),
+    ) %>%
+    select(mz_start, mz_stop) %>%
+    pivot_longer(cols = c(mz_start, mz_stop), names_to = NULL, values_to = "mz") %>%
+    pull(mz) %>%
+    unique()
+  
+  plot <-
+    isotopic_envelope %>%
+    select(mz, prob) %>%
+    ggplot(aes(x = mz, weight = prob)) +
+    geom_histogram(binwidth = 0.1, center = pre_mz) +
+    geom_vline(xintercept = mz_window_edges, color = "red", linetype = 2) +
+    scale_y_continuous(breaks = 0.25 * 0:4) +
+    coord_cartesian(xlim = pre_mz + 2.1 * c(-1, 1)) +
+    labs(x = expression(italic(m/z)), y = "rel. Abund.") +
+    theme(panel.grid.major.y = element_line(color = "grey90"))
+  
+  rm_all_except(plot)
+  plot
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(plot_isotopes = list(make_plot_isotopes(pre_mz, ms2_scan_numbers, isotopic_envelope))) %>%
+  ungroup()
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(plot_isotopes) %>%
+#   walk(print)
+```
+
+```{r}
+make_plot_it <- function(ms2_scan_numbers, plot_rt_lims) {
+  as.list(environment()) # ensure that everything is evaluated and nothing refers back to the global env
+  
+  rt_cutoff <- range_plus_Xperc(plot_rt_lims, percent = 10)
+  
+  plot <-
+    ms_headers_ms2 %>%
+    select(scan_number, rt, max_it, it) %>%
+    filter(scan_number %in% ms2_scan_numbers, between(rt, rt_cutoff[1], rt_cutoff[2])) %>%
+    select(-scan_number) %>%
+    pivot_longer(-rt, names_to = "ittype", values_to = "itval") %>%
+    mutate(ittype = factor(ittype, levels = c("max_it", "it"), labels = c("Maximum", "Actual"))) %>%
+    select(rt, itval, ittype) %>%
+    ggplot(aes(x = rt, y = itval, linetype = ittype, color = ittype)) +
+    geom_step(direction = "vh") +
+    expand_limits(x = plot_rt_lims, y = 0) +
+    scale_linetype_manual(values = c(Maximum = 2, Actual = 1)) +
+    scale_color_manual(values = c(Maximum = "red", Actual = "black")) +
+    # scale_y_continuous(labels = scales::scientific) +
+    labs(x = "Retention Time (min)", y = "Injection Time (ms)", linetype = "Injection Time", color = "Injection Time") +
+    coord_cartesian(xlim = plot_rt_lims, ylim = c(0, NA))
+  
+  rm_all_except(plot)
+  plot
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(plot_it = list(make_plot_it(ms2_scan_numbers, plot_rt_lims))) %>%
+  ungroup()
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(plot_it) %>%
+#   walk(print)
+```
+
+```{r}
+make_plot_agc <- function(ms2_scan_numbers, plot_rt_lims) {
+  as.list(environment()) # ensure that everything is evaluated and nothing refers back to the global env
+  
+  rt_cutoff <- range_plus_Xperc(plot_rt_lims, percent = 10)
+  
+  ms_headers_df <-
+    ms_headers_ms2 %>%
+    select(scan_number, rt, max_it, it, agc_target, agc_fill) %>%
+    filter(scan_number %in% ms2_scan_numbers, between(rt, rt_cutoff[1], rt_cutoff[2])) %>%
+    select(-scan_number)
+
+  if (nrow(ms_headers_df) > 0) {
+    max_agc_target <- max(ms_headers_df$agc_target)
+    max_max_it <- max(ms_headers_df$max_it)
+    it_scaling_factor <- max_agc_target / max_max_it
+  } else {
+    max_agc_target <- NA_real_
+    max_max_it <- NA_real_
+    it_scaling_factor <- 1
+  }
+  
+  plot <-
+    ms_headers_df %>%
+    select(rt, agc_fill, agc_target, it) %>%
+    ggplot(aes(x = rt)) +
+    # geom_line(aes(y = agc_ions), color = "black") +
+    # geom_line(aes(y = it * it_scaling_factor), color = "blue") +
+    geom_step(aes(y = agc_fill * agc_target), color = "black", direction = "vh") +
+    geom_step(aes(y = it * !!it_scaling_factor), color = "blue", direction = "vh") +
+    geom_hline(yintercept = max_agc_target, color = "red", na.rm = TRUE) +
+    scale_y_continuous(
+      labels = scales::scientific,
+      sec.axis = sec_axis(
+        trans = ~ . / it_scaling_factor,
+        name = "Injection Time (ms)"
+      )
+    ) +
+    expand_limits(x = plot_rt_lims, y = 0) +
+    labs(x = "Retention Time (min)", y = "est. AGC Chrg. (#)") +
+    theme(
+      axis.ticks.y.right = element_line(color = "blue"),
+      axis.text.y.right = element_text(color = "blue"),
+      axis.title.y.right = element_text(color = "blue")
+    ) +
+    coord_cartesian(xlim = plot_rt_lims, ylim = c(0, NA))
+  
+  rm_all_except(plot)
+  plot
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(plot_agc = list(make_plot_agc(ms2_scan_numbers, plot_rt_lims))) %>%
+  ungroup()
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(plot_agc) %>%
+#   walk(print)
+```
+
+```{r}
+make_plot_agc_by_tic <- function(ms2_scan_numbers, plot_rt_lims) {
+  as.list(environment()) # ensure that everything is evaluated and nothing refers back to the global env
+  
+  rt_cutoff <- range_plus_Xperc(plot_rt_lims, percent = 10)
+  
+  ms_headers_df <-
+    ms_headers_ms2 %>%
+    select(scan_number, rt, tic, it, agc_target) %>%
+    filter(scan_number %in% ms2_scan_numbers, between(rt, rt_cutoff[1], rt_cutoff[2])) %>%
+    select(-scan_number)
+  
+  if (nrow(ms_headers_df) > 0) {
+    max_agc_target <- max(ms_headers_df$agc_target)
+  } else {
+    max_agc_target <- NA_real_
+  }
+  
+  plot <-
+    ms_headers_df %>%
+    select(rt, tic, it) %>%
+    ggplot(aes(x = rt)) +
+    # geom_line(aes(y = tic * it / 1000)) +
+    geom_step(aes(y = tic * it / 1000), direction = "vh") +
+    geom_hline(yintercept = max_agc_target, color = "red", na.rm = TRUE) +
+    expand_limits(x = plot_rt_lims, y = 0) +
+    scale_y_continuous(labels = scales::scientific) +
+    labs(x = "Retention Time (min)", y = "Scan Chrg. (#)") +
+    coord_cartesian(xlim = plot_rt_lims)
+  
+  rm_all_except(plot)
+  plot
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(plot_agc_by_tic = list(make_plot_agc_by_tic(ms2_scan_numbers, plot_rt_lims))) %>%
+  ungroup()
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(plot_agc_by_tic) %>%
+#   walk(print)
+```
+
+```{r}
+make_plot_ms1_chrom <- function(locator_precursor, pre_charge, pre_rt_min, pre_rt_max, plot_rt_lims) {
+  as.list(environment()) # ensure that everything is evaluated and nothing refers back to the global env
+  
+  if (exists("ms1_data")) {
+    # ms1 data has already been trimmed on the RT axis
+    ms1_data_df <- ms1_data[[as.character(locator_precursor)]]
+    annotation <- NULL
+    
+    if (!is.na(pre_rt_max) && !is.na(pre_rt_min)) {
+      i_max <-
+        ms1_data_df %>%
+        filter(between(rt, pre_rt_min - 0.005, pre_rt_max + 0.005)) %>%
+        pull(i) %>%
+        max()
+    } else {
+      i_max <- max(ms1_data_df$i)
+    }
+    
+    if (i_max == 0)
+      i_max <- 1
+  } else {
+    ms1_data_df <- tibble(mass_offset = numeric(), rt = numeric(), i = numeric())
+    annotation <- annotate("text_npc", label = "No data available", npcx = 0.5, hjust = 0.5, npcy = 0.5, vjust = 0.5, size = 2)
+    i_max <- 1
+  }
+  
+  plot <-
+    ms1_data_df %>%
+    mutate(Ion = factor(mass_offset, levels = 0:2, labels = paste0(c('"[M]"', '"[M+1]"', '"[M+2]"'), '^"', !!pre_charge, '+"'))) %>%
+    select(Ion, rt, i) %>%
+    ggplot(aes(rt, i, linetype = Ion)) +
+    geom_line() +
+    expand_limits(x = plot_rt_lims, y = 0) +
+    scale_y_continuous(labels = scales::scientific) +
+    scale_linetype_discrete(drop = FALSE, labels = scales::label_parse()) +
+    annotation +
+    coord_cartesian(xlim = plot_rt_lims, ylim = c(0, i_max)) +
+    labs(x = "Retention Time (min)", y = "Intensity (a.u)") +
+    theme(legend.position = c(1, 1), legend.justification = c(1, 1), legend.title.align = 0)
+  
+  rm_all_except(plot)
+  plot
+}
+  
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(plot_ms1_chrom = list(make_plot_ms1_chrom(locator_precursor, pre_charge, pre_rt_min, pre_rt_max, plot_rt_lims))) %>%
+  ungroup()
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(plot_ms1_chrom) %>%
+#   walk(print)
+```
+
+```{r}
+plot_chrom_vs_ref_custom <- function(data_upper, data_lower, rt_lims, i_lims, rt_markers = numeric(), label_undetected_transitions = TRUE, label_unquantitative_transitions = TRUE, parse_transitions = FALSE, ...) {
+  as.list(environment()) # ensure that everything is evaluated and nothing refers back to the global env
+  
+  if (nrow(data_upper) > 0)
+    stopifnot(all(data_upper$i >= 0))
+
+  mode <- "top"
+  if (nrow(data_lower) > 0) {
+    mode <- "both"
+    data_lower <- mutate(data_lower, i = -i)
+    stopifnot(all(data_lower$i <= 0))
+  }
+  
+  transitions_detected <-
+    data_upper %>%
+    filter(transition_i + transition_i_bg > 0) %>%
+    pull(transition_name) %>%
+    unique()
+  transitions_non_quantitative <-
+    data_upper %>%
+    filter(!transition_is_quantitative) %>%
+    pull(transition_name) %>%
+    unique()
+
+  data_plot <- bind_rows(sample = data_upper, reference = data_lower, .id = "type")
+  
+  stopifnot(nrow(data_plot) > 0)
+
+  data_plot <- mutate(data_plot,
+    is_pre = transition == "precursor",
+    transition_is_detected = transition_name %in% transitions_detected,
+    transition_is_quantitative = !(transition_name %in% transitions_non_quantitative),
+  )
+
+  if (has_name(data_plot, "transition_rank_lib"))
+    data_plot <- arrange(data_plot, !is_pre, transition_rank_lib)
+  else
+    data_plot <- arrange(data_plot, !is_pre, desc(transition_ordinal), transition_mz)
+  
+  labeller <- if (parse_transitions) scales::label_parse() else waiver()
+  
+  if (label_undetected_transitions) {
+    undetected_label <- if (parse_transitions) '*" (n.d.)"' else ' (n.d.)'
+    undetected_linetype <- "dashed"
+  } else {
+    undetected_label <- ''
+    undetected_linetype <- "solid"
+  }
+  if (label_unquantitative_transitions) {
+    unquantitative_label <- if (parse_transitions) '*" (n.q.)"' else ' (n.q.)'
+    unquantitative_linetype <- "dashed"
+  } else {
+    unquantitative_label <- ''
+    unquantitative_linetype <- "solid"
+  }
+  
+  data_plot <- mutate(data_plot,
+    transition_name_label = fct_inorder(case_when(
+      !transition_is_detected ~ str_append(transition_name, undetected_label),
+      !transition_is_quantitative ~ str_append(transition_name, unquantitative_label),
+      TRUE ~ transition_name
+    ))
+  )
+  
+  transition_linetypes <-
+    data_plot %>%
+    distinct(transition_name_label, transition_is_detected, transition_is_quantitative) %>%
+    mutate(linetype = case_when(
+      !transition_is_detected ~ undetected_linetype,
+      !transition_is_quantitative ~ unquantitative_linetype,
+      TRUE ~ "solid"
+    )) %>%
+    select(transition_name_label, linetype) %>%
+    deframe()
+  
+  plot <-
+    data_plot %>%
+    unite("group", type, transition_name_label, transition_mz, remove = FALSE) %>%
+    select(group, transition_name_label, rt, i) %>%
+    ggplot(aes(rt, i, group = group, color = transition_name_label, linetype = transition_name_label)) +
+    annotate("segment", x = rt_markers, xend = rt_markers, y = 0, yend = Inf, linetype = "dashed", color = "black", alpha = 0.1, linewidth = 0.3, na.rm = TRUE) +
+    geom_line(linewidth = 0.3) +
+    geom_hline(yintercept = 0, linewidth = 0.3) +
+    scale_linetype_manual(values = transition_linetypes, labels = labeller) +
+    scale_color_discrete(labels = labeller) +
+    labs(x = "Retention Time (min)", y = "Intensity (a.u.)", color = "Ion", linetype = "Ion")
+  
+  if (!missing(rt_lims))
+    plot <- plot + coord_cartesian(xlim = rt_lims)
+
+  plot_i_lims <- range(data_plot$i)
+  if (!missing(i_lims)) {
+    if (!is.na(i_lims[1])) plot_i_lims[1] <- i_lims[1]
+    if (!is.na(i_lims[2])) plot_i_lims[2] <- i_lims[2]
+  }
+
+  plot <- normalize_neg_scale(plot, yvals = plot_i_lims, mode = mode, ...)
+  
+  rm_all_except(plot)
+  plot
+}
+
+make_plot_chrom <- function(pre_rt, pre_rt_min, pre_rt_max, plot_rt_lims, plot_i_lims, transitions_df, has_speclib, speclib_id, speclib_precursor, align_speclib = TRUE) {
+  as.list(environment()) # ensure that everything is evaluated and nothing refers back to the global env
+  
+  top_plot_df <-
+    transitions_df %>%
+    filter(scan_type == "Full Ms2") %>%
+    unnest(chromatogram_df)
+  
+  if (nrow(top_plot_df) == 0)
+    top_plot_df <- mutate(top_plot_df, transition_name = character(), scan_number = numeric(), rt = numeric())
+  
+  if (has_speclib) {
+    bottom_plot_df <-
+      speclib_precursor$transitions_df %>%
+      semi_join(top_plot_df, by = join_by(transition_name, scan_type)) %>%
+      unnest(chromatogram_df)
+  } else {
+    bottom_plot_df <- top_plot_df[integer(), ]
+  }
+    
+  if (has_speclib && !is.na(speclib_id)) {
+    if (align_speclib) {
+      speclib_rt_to_sample <- speclibs[[speclib_id]]$speclib_rt_transformer$speclib_to_sample
+      bottom_plot_df <- mutate(bottom_plot_df, rt = speclib_rt_to_sample(rt))
+    }
+    bottom_label <- "assay-external reference"
+  } else {
+    bottom_label <- NA_character_
+  }
+  
+  format_transitions <- function(x) {
+    x %>%
+      str_replace("^precursor\\s?(.*?)(\\++)$", '"[M\\1]"^"\\2"') %>%
+      str_replace("^([abcxyz])\\s?(.*?)(\\++)$", '"\\1\\2"^"\\3"')
+  }
+  
+  top_plot_df <- mutate(top_plot_df, transition_name = format_transitions(transition_name))
+  bottom_plot_df <- mutate(bottom_plot_df, transition_name = format_transitions(transition_name))
+  
+  top_rt_range <- range(top_plot_df$rt)
+  
+  rt_cutoff <- range_plus_Xperc(plot_rt_lims, percent = 10)
+  top_plot_df <- filter(top_plot_df, between(rt, rt_cutoff[1], rt_cutoff[2]))
+  bottom_plot_df <- filter(bottom_plot_df, between(rt, rt_cutoff[1], rt_cutoff[2]))
+  
+  plot <-
+    plot_chrom_vs_ref_custom(
+      top_plot_df,
+      bottom_plot_df,
+      rt_lims = plot_rt_lims,
+      i_lims = plot_i_lims,
+      rt_markers = c(pre_rt_min, pre_rt_max),
+      label_undetected_transitions = !is.na(pre_rt),
+      label_unquantitative_transitions = TRUE,
+      parse_transitions = TRUE,
+      top_scale_factor = 2
+    ) +
+      annotate("text", label = "\u25BA", x = top_rt_range[1], y = 0, color = "black", size = 1.6, vjust = 0.47, hjust = 1) +
+      annotate("text", label = "\u25C4", x = top_rt_range[2], y = 0, color = "black", size = 1.6, vjust = 0.47, hjust = 0)
+  
+  if (!is.na(bottom_label))
+    plot <- plot + annotate("text_npc", label = paste0("  ", bottom_label), npcx = 0, npcy = 0, vjust = -.8, hjust = 0, size = 2)
+  
+  plot <- plot + theme(
+    legend.position = c(1, 1),
+    legend.justification = c(1, 1),
+    legend.title.align = 0
+  )
+  
+  rm_all_except(plot)
+  plot
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(
+    plot_chrom = list(make_plot_chrom(pre_rt, pre_rt_min, pre_rt_max, plot_rt_lims, plot_i_lims, transitions_df, has_speclib, speclib_id, speclib_precursor, align_speclib = TRUE)),
+    plot_chrom_unaligned = list(make_plot_chrom(pre_rt, pre_rt_min, pre_rt_max, plot_rt_lims_unaligned, plot_i_lims, transitions_df, has_speclib, speclib_id, speclib_precursor, align_speclib = FALSE))
+  ) %>%
+  ungroup()
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(plot_chrom) %>%
+#   walk(print)
+```
+
+```{r}
+#| fig-height: 4.81
+
+plot_heights <- c(0.9, 1.4, 2, 2, 5.6)
+
+make_plot_arranged <- function(plot_header, plot_isotopes, plot_ms1_chrom, plot_agc, plot_chrom, plot_heights) {
+  wrap_plots(
+    wrap_elements(plot = plot_header),
+    plot_isotopes,
+    plot_agc +
+      theme(
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank()
+      ),
+    plot_ms1_chrom +
+      theme(
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+      ),
+    plot_chrom +
+      guides(color = guide_legend(ncol = 1), linetype = guide_legend(ncol = 1)),
+    ncol = 1,
+    heights = plot_heights
+  )
+}
+
+id_all_precursors_df <-
+  id_all_precursors_df %>%
+  rowwise(everything()) %>%
+  mutate(plot_arranged = list(make_plot_arranged(plot_header, plot_isotopes, plot_ms1_chrom, plot_agc, plot_chrom, plot_heights))) %>%
+  ungroup()
+
+# id_all_precursors_df %>%
+#   sample_n(5) %>%
+#   pull(plot_arranged) %>%
+#   walk(print)
+```
+
+```{r}
+#| include: TRUE
+#| fig-height: 4.81
+
+for (i in seq(1, nrow(id_all_precursors_df), by = 2)) {
+  plot_left <- id_all_precursors_df$plot_arranged[[i]]
+  if (i < nrow(id_all_precursors_df)) {
+    plot_right <- id_all_precursors_df$plot_arranged[[i + 1]]
+  } else {
+    plot_right <- plot_spacer()
+  }
+
+  print(wrap_plots(plot_left, plot_right, nrow = 1, ncol = 2, widths = c(1, 1)))
+}
+```
+
+```{r}
+# Plots write out
+plot_list <-
+  id_all_precursors_df %>%
+  select(-transitions_df, -plot_arranged) %>%
+  transpose() %>%
+  # use seq_plot_title as names for the list
+  set_names(., map_chr(., "seq_plot_title"))
+
+saveRDS(plot_list, path(params$path, paste0("!PRM_Report_", params$report_tag, "_plots.rds")))
+```
+
+```{r}
+# Data write out
+data_list <-
+  list(
+    info = list_assign(info,
+      ms_files = ms_files,
+      ms_files_origin = ms_files_origin,
+      skip_ms1 = skip_ms1,
+      has_ms1 = has_ms1,
+      rt_shift_mark = rt_shift_mark,
+      i_total = if (has_ms1) i_total else NA_real_,
+      i_2_3 = if (has_ms1) i_2_3 else NA_real_,
+      i_too_much = if (has_ms1) i_too_much else NA_real_,
+      max_charge_state = max_charge_state,
+      locator_replicate_sample = locator_replicate_sample,
+      locator_replicate_rt_reference = locator_replicate_rt_reference
+    ),
+    replicates_df = replicates_df,
+    dotp_plot_df = dotp_plot_df,
+    dotp_plots = dotp_plots,
+    charges_i_sum_df = if (has_ms1) charges_i_sum_df else NULL,
+    tic_charges_plot = if (has_ms1) tic_charges_plot else NULL,
+    id_all_precursors_df = select(id_all_precursors_df, -plot_arranged, -speclib_precursor),
+    irt_sample_precursors_df = irt_sample_precursors_df
+  )
+
+saveRDS(data_list, path(params$path, paste0("!PRM_Report_", params$report_tag, "_data.rds")))
+```

@@ -1,0 +1,32 @@
+Package: MSTargetedWorkflows
+Type: Package
+Title: Process MS data
+Version: 0.11.0
+Authors@R: person("Jonas D.", "Förster", email = "jonasfoerster@gmail.com", role = c("aut", "cre"))
+Description: ...
+License: Artistic-2.0 | file LICENSE
+Encoding: UTF-8
+Depends:
+    R (>= 3.2)
+Imports:
+    assertthat,
+    crayon,
+    dplyr,
+    ggplot2,
+    magrittr,
+    methods,
+    MsRawAccess,
+    parallel,
+    processx,
+    purrr,
+    readr,
+    rlang,
+    scales,
+    stats,
+    stringr,
+    tibble,
+    tidyr,
+    tidyselect,
+    utils,
+    vctrs
+RoxygenNote: 7.2.3

@@ -1,0 +1,211 @@
+---
+title: Make inclusion lists for direct infusion RF Lens scans
+author: "Jonas D. Förster"
+project:
+  execute-dir: file
+params:
+  peptide_set: peptide_list
+---
+
+# Info
+
+Make inclusion lists for per-precursor RF Lens scans
+
+# Setup
+
+```{r setup}
+library(conflicted)
+library(here)
+library(tidyverse)
+library(MSTargetedWorkflows)
+conflicts_prefer(
+  dplyr::filter,
+  .quiet = TRUE
+)
+read_csv <- partial(readr::read_csv, lazy = FALSE)
+read_tsv <- partial(readr::read_tsv, lazy = FALSE)
+cat0 <- partial(cat, sep = "")
+top_i <- sym("nce_top_i")
+seq_cov <- sym("nce_seq_cov")
+
+# seed for random number generator, guaranteeing reproducibly randomized scan orders
+set.seed(1)
+```
+
+# Settings
+
+```{r settings}
+peptide_set <- params$peptide_set
+
+rf_scan <- c(10, 25, 30, 40, 50, 65, 80, 100, 125, 150)
+rf_scan
+
+# how many times to go over each scan value
+scan_count <- 5
+
+# amount of entries per inclusion list. Limited by Thermo software list limits.
+# between each input list, a ms1 overview scan can be placed, which helps with quality control
+list_split_length <- 2500L
+
+# select between nce optimised for top fragment intensity (top_i) or sequence coverage (seq_cov)
+# nce_type <- top_i
+nce_type <- seq_cov
+
+# Use per precursor optimized NCE?
+nce_use <- TRUE
+nce_default <- 30
+# Only add precursors, with known, optimized NCE?
+nce_only_optimized <- TRUE
+```
+
+```{r}
+# custom rules can be defined here to manipulate which precursors are included
+schedule_filters <- lst(
+  # ~ filter(.x, str_count(seq, coll("M")) == str_count(seq_mod, coll("M[Oxidation]"))), # discard unoxidized M precursors
+  # ~ filter(.x, str_count(seq, coll("C")) == str_count(seq_mod, coll("C[Carbamidomethyl]"))), # discard unmodified cysteines
+  # ~ filter(.x, !str_detect(seq_mod, coll("C[Carbamidomethyl]"))), # discard modified cysteines
+)
+```
+
+# Processing
+
+```{r}
+rf_scan_full_schuffled <-
+  map(1:scan_count, ~ sample(rf_scan)) %>%
+  flatten_dbl()
+
+rf_scan_full_schuffled %>%
+  enframe("y", "cv") %>%
+  ggplot(aes(x = cv, y = y)) +
+  geom_point() +
+  geom_line(orientation = "y") +
+  scale_y_reverse() +
+  labs(x = "RF Lens (%)", y = "Scan Order")
+```
+
+```{r}
+out_dir <- "static_rf_scan"
+if (!dir.exists(out_dir))
+  dir.create(out_dir)
+```
+
+```{r}
+precursors_df <-
+  here("!Peptide Lists", "precursors", paste0(peptide_set, ".csv")) %>%
+  read_csv(col_types = cols_only(
+    n = col_double(),
+    list_number = col_double(),
+    seq = col_character(),
+    seq_sil = col_character(),
+    seq_mod = col_character(),
+    seq_mod_sil = col_character(),
+    formula_heavy = col_character(),
+    pre_charge = col_double(),
+    mz_heavy = col_double()
+  )) %>%
+  mutate(
+    across(c(seq, seq_sil, seq_mod, seq_mod_sil), fct_inorder),
+    n = unclass(seq_mod)
+  )
+
+precursors_df
+```
+
+```{r}
+weak_to_na <- function(x) replace(x, x == "weak", NA_character_)
+
+optimizations_df <-
+  here("!Peptide Lists", "optimized_oe", paste0(peptide_set, ".csv")) %>%
+  read_csv(col_types = cols_only(
+    seq_mod = col_character(),
+    pre_charge = col_double(),
+    nce_top_i = col_character(),
+    nce_seq_cov = col_character()
+  )) %>%
+  mutate(across(c(nce_top_i, nce_seq_cov), weak_to_na)) %>%
+  mutate(across(c(nce_top_i, nce_seq_cov), as.numeric)) %>%
+  mutate(nce = !!nce_type, .before = nce_top_i)
+
+optimizations_df
+```
+
+```{r}
+apply_schedule_filters <- function(df) {
+  for (fun in schedule_filters) df <- as_mapper(fun)(df)
+  df
+}
+
+schedule_df <-
+  precursors_df %>%
+  left_join(optimizations_df, by = join_by(seq_mod, pre_charge), relationship = "many-to-one") %>%
+  filter(
+    !nce_use | (!nce_only_optimized | !is.na(nce))
+  ) %>%
+  replace_na(list(nce = nce_default))
+
+precursors_lost <- discard(unique(precursors_df$seq_mod), `%in%`, schedule_df$seq_mod)
+
+schedule_df <- apply_schedule_filters(schedule_df)
+
+schedule_df
+
+if (!is_empty(precursors_lost))
+  warning("Peptides lost due to missing optimization: ", paste0(precursors_lost, collapse = ", "))
+```
+
+```{r}
+oe_quadrupole_iso_df <- tribble(
+   ~mz, ~iso_w_mz,
+   400,       0.4,
+   700,       0.7,
+  1000,         1,
+  1500,       1.5,
+  2000,         2,
+  2500,         3,
+)
+
+# get optimal precursor isolation window according to thermo OE manual
+get_isolation_window <- function(mz) {
+    stopifnot(mz <= 2500)
+
+    i <- which.max(oe_quadrupole_iso_df$mz >= mz)
+    
+    oe_quadrupole_iso_df$iso_w_mz[i]
+}
+```
+
+```{r}
+schedule_out_df <-
+  schedule_df %>%
+  mutate(
+    Compound = paste0(seq_mod_sil, str_dup("+", pre_charge)),
+    Adduct = "+H",
+    iso_w_mz = map_dbl(mz_heavy, get_isolation_window),
+  ) %>%
+  select(
+    Compound,
+    Formula = formula_heavy,
+    Adduct,
+    `m/z` = mz_heavy,
+    z = pre_charge,
+    `Isolation Window (m/z)` = iso_w_mz,
+    `HCD Collision Energy (%)` = nce
+  )
+
+if (!nce_use)
+  schedule_out_df <- select(schedule_out_df, -`HCD Collision Energy (%)`)
+
+schedule_out_df <-
+  schedule_out_df %>%
+  mutate(`RF Lens (%)` = list(rf_scan_full_schuffled)) %>%
+  unchop(`RF Lens (%)`) %>%
+  mutate(n_list = ceiling(row_number() / list_split_length))
+
+schedule_out_df
+
+schedule_out_df %>%
+  group_by(n_list) %>%
+  group_walk(function(df, n) {
+    write_csv(df, file.path(out_dir, paste0(peptide_set, "_rf_shuffled_", n$n_list, ".csv")))
+  })
+```

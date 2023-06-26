@@ -1,0 +1,9 @@
+[deps]
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+MSUtils2 = "3086c962-f598-45f1-9b20-e5e4795d5aa5"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Peptidomics = "7087a3cb-cac9-4c35-bef9-c852c0bb808a"
+RCall = "6f49c342-dc21-5d91-9882-a32aef131414"
+Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
+Suppressor = "fd094767-a336-5f1f-9728-57cf17d0bbfb"
+Underscores = "d9a01c3f-67ce-4d8c-9b55-35f6e4050bb1"

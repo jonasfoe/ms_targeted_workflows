@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<views>
+  <view name="id_all_chromatograms" rowsource="pwiz.Skyline.Model.Databinding.Entities.Transition" sublist="Results!*" uimode="proteomic">
+    <column name="Results!*.Value.PrecursorResult.PeptideResult.ResultFile.Replicate.Locator" />
+    <column name="Locator" />
+    <column name="Results!*.Value.Chromatogram.RawData.SpectrumIds" />
+    <column name="Results!*.Value.Chromatogram.RawData.Times" />
+    <column name="Results!*.Value.Chromatogram.RawData.Intensities" />
+  </view>
+</views>

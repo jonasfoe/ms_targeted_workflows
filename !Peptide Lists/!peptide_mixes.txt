@@ -1,0 +1,2 @@
+# this file names all mixes of peptides that are physically available, so that some scripts can output instructions on which mixes are required to get full peptide coverage
+# no file extensions

@@ -1,0 +1,234 @@
+---
+title: Make schedules for scheduled PRM type methods
+author: "Jonas D. Förster"
+project:
+    execute-dir: file
+---
+
+# Info
+
+Uses data in '!Peptide Lists/optimized_oe' to make a schedule for a targeted assay
+
+# Setup
+
+```{r setup}
+source("!make_schedule_code.R")
+eval(code$setup)
+```
+
+# Settings
+
+```{r}
+# define the peptides targeted here, based on the .txt lists in the folder '!Peptide Lists'
+peptide_set <- c("peptide_list")
+
+# add further individual peptides by sequence
+# format: "peptide_list_name" = "sequence"
+seq_include_extra <- c(
+	# "canonical_sil_labels" = "YMLDLQPET",
+c())
+
+# use this to target only a very specific set of peptides our of the peptide_set
+# cat0('"', paste0(unique(arrange(schedule_df, rt)$seq), collapse = '", "'), '"')
+seq_include_only <- c()
+
+rt_window <- 2 # 2 is default typically used for our 120min gradient
+# after/before all irts are eluted, rt times have to be extrapolated and might be more error prone, so longer windows could help
+rt_window_outside_irt <- 7 # 3.5 is default typically used for our 120min gradient
+
+# if tSIM is used, it won't use dynamic RT so wider windows might be desired.
+rt_window_tsim <- 4
+
+# rt windows for irts peptides are set seperately
+rt_window_irt <- 2.5 # 2.5 is default typically used for our 120min gradient
+# dynamic RT with PRTCs can use different windows
+rt_window_prtc <- 2 # 2 is default typically used for our 120min gradient
+# a wider window can be set for the first prtc. Will be applied to both irt output lists
+rt_window_prtc_first <- 6 # 6 is default typically used for our 120min gradient
+
+# The best precursors charge states are marked in the optimization file.
+# The precursors are marked with a priority value. Typically, each peptide will have one best precursor marked with '1'.
+# Here you can decide to also include further precursors down the ranking (e.g. +++ in addition to ++)
+# Only use selected favorable precursors?
+preferred_precursors_only <- TRUE
+preferred_precursors_include_priority <- 1 # 1 is default, to include only the best precursor
+
+# select between nce optimised for top fragment intensity (top_i) or sequence coverage (seq_cov)
+nce_type <- top_i
+nce_type <- seq_cov
+
+# Use per precursor optimized NCE?
+nce_use <- TRUE
+nce_default <- 30
+# Only add precursors, with known, optimized NCE?
+nce_only_optimized <- FALSE
+
+# Use per precursor optimized RF Lens?
+rf_use <- FALSE
+rf_default <- 50
+# Only add precursors, with known, optimized RF Lens?
+rf_only_optimized <- FALSE
+
+# Use FAIMS?
+faims_use <- FALSE
+faims_default <- NA
+# Only add precursors, with known, optimized FAIMS CV?
+faims_only_optimized <- TRUE
+```
+
+```{r}
+# custom rules can be defined here to manipulate the schedule
+schedule_filters <- lst(
+  # ~ filter(.x, str_count(seq, coll("M")) == str_count(seq_mod, coll("M[Oxidation]"))), # discard unoxidized M precursors
+  # ~ filter(.x, str_count(seq, coll("C")) == str_count(seq_mod, coll("C[Carbamidomethyl]"))), # discard unmodified cysteines
+  # ~ filter(.x, !str_detect(seq_mod, coll("C[Carbamidomethyl]"))), # discard modified cysteines
+  # ~ filter(.x, !(between(rt, left = 25, right = 999) & preferred_precursor > 1)), # force stricter priority between minutes left and right
+  # ~ filter(.x, !(between(rt, left = 34, right = 38.) & preferred_precursor > 1)), # force stricter priority between minutes left and right
+  # ~ filter(.x, difftime(Sys.Date(), irt_date, unit = "days") > 20), # keep/drop peptides for which the iRT reference is outdated
+)
+```
+
+```{r}
+# uses id_all.csv of the latest iRT reference run
+irt_latest_folder <- "prtc/55min PRM speclib"
+
+irt_fallback_folder <- irt_latest_folder
+
+# the fallback will only be used to fill in gaps in case some iRT peptides are missing in the latest detection
+# so best keep it to a complete set
+# comment the following line out to disable
+irt_fallback_folder <- "prtc/55min PRM speclib"
+
+# the set of irts that is targeted in the assay
+# irts <- irt_list$pierce_15
+irts <- irt_list$prtc_jptrt_26
+```
+
+# Processing
+
+```{r}
+out_dir <- "schedules"
+if (!dir.exists(out_dir))
+  dir.create(out_dir)
+```
+
+```{r}
+eval(code$process_settings)
+```
+
+```{r}
+# Read in irt and irt fallback data
+# Using options `irt_latest_folder`, `irt_fallback_folder`, `irts`
+eval(code$readin_irts)
+
+# Fill all the missing iRT data according to extrapolations from the fallback
+eval(code$irt_fallback_merge)
+
+# irt_fallback_df
+# irt_df
+```
+
+```{r}
+# Compute a name for the assay
+# Using options `peptide_set`
+# Either just the singular name of the selected peptide set or an abbreviated concatenation of all.
+eval(code$compute_peptide_set_name)
+```
+
+```{r}
+# Read in static precursor data (chemical formula, mz, charge, etc)
+# Using options `peptide_set`
+# From relevant !Peptide Lists/precursors/<peptide_set>.csv files
+eval(code$readin_precursors)
+
+# precursors_df
+```
+
+```{r}
+# Read in precursor optimization data (preferred precursor, collision energy, rt, etc)
+# Using options `peptide_set`
+# From !Peptide Lists/optimized_oe/!all_peptides.csv
+eval(code$readin_precursor_optimizations)
+
+# optimizations_df
+```
+
+```{r}
+# Create scheduling data by integrating the selected optimizations (nce, faims_cv, etc) and computing the rt from the relative iRT information that is saved for each peptide
+# Using options `schedule_filters`, `preferred_precursors_only`, `preferred_precursors_include_priority`, `seq_include_only`
+eval(code$create_schedules)
+
+# schedule_prtc_df
+# schedule_df
+```
+
+```{r}
+# Integrate the recommended effective quadrupole isolation limits according to the thermo oe manual
+eval(code$quad_isolation_rules)
+
+# oe_quadrupole_iso_df
+```
+
+```{r}
+# Write out the prtc dynamic RT information to *_dynRT.csv
+# Using options `rt_window_irt_first`, `rt_window_irt`
+# This is the table that tells the method when the prtc peptides are expected to elute, which is the basis for how the dynamic RT adjustments are calculated.
+# The table also gives a window which limits how far off the expected time the prtc peptide can still be accepted as a true hit, triggering the adjustments.
+# The table does not determine how the prtc peptide is targeted. A suitable scan to target these peptides needs to be set up in the method.
+# Currently, the import button for this table is missing in the Thermo Method Editor. The contents have to be copied over manually.
+eval(code$create_dynrt_schedule)
+
+# schedule_prtc_dynrt_out_df
+```
+
+```{r}
+# Write out the prtc PRM schedule to *_irt_schedule.csv
+# Using options `rt_window_irt_first`, `rt_window_irt`, `faims_use`
+eval(code$create_irt_schedule)
+
+# schedule_prtc_out_df
+```
+
+```{r}
+# Write out the heavy and light target schedules to *_heavy_schedule.csv and *_light_schedule.csv
+# Using options `rt_window`, `rt_window_post_irt`, `nce_use`, `nce_only_optimized`, `nce_default`, `rf_use`, `rf_only_optimized`, `rf_default`, `faims_use`, `faims_only_optimized`, `faims_default`, `irts`
+eval(code$create_schedule)
+
+# schedule_out_light_df
+# schedule_out_heavy_df
+```
+
+# Schedule Information
+
+```{r, fig.width=17, fig.height=10}
+#| fig-width: 17
+#| fig-height: 10
+
+# Print the targeting window overlaps to understand how many different precursors the instrument has to shuffle through at any time
+# In case the method uses dynamic max IT, the load here determines what sensitivity can be achieved due to dynamic lowering of injection time in case of large load.
+# In case the method uses static max IT, the load here determines the sample rate of the peaks
+eval(code$create_schedule_overlap_plot)
+schedue_overlaps_plot()
+```
+
+```{r, fig.width=17, fig.height=7}
+#| fig-width: 17
+#| fig-height: 7
+
+# Print the age of the iRT reference data in use for the different peptides.
+# An age of several weeks might be problematic when narrow 2 min RT scheduling windows are used.
+# This is especially relevant when a column change happened in between.
+eval(code$create_rt_age_plot)
+plot_rt_age
+```
+
+# Mix permutations
+
+```{r}
+# Calculate which combinations of peptide mixes allow for complete coverage of all target peptides.
+eval(code$calculate_peptide_mixes)
+```
+
+```{r include=FALSE}
+cat0("Finished: ", date(), "\n")
+```

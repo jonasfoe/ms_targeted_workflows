@@ -1,0 +1,19 @@
+# This file names all peptides that are used as RT reference points in order of elution
+# To make effective use of orbitrap dynamic RT feature, the PRTC peptides should be present
+# Use seq_semi_mod_sky notation (Skyline: Peptide Modified Sequence Monoisotopic Masses) in case there are any modifications
+# This file anchors all the irt data in the optimisations folder. So if changes are made here, it may invalidate all that data.
+SSAAPPPPPR
+GISNEGQNASIK
+HVLTSIGEK
+DIPVPKPK
+IGDYAGIK
+TASEFDSAIAQDK
+SAAGAFGPELSR
+ELGQSGVDTYLQTK
+SFANQPLEVVYSK
+GLILVGGYGTR
+GILFVGSGVSGGEEGAR
+LTILEELR
+NGFILDGFPR
+ELASGLSFPVGFK
+LSSEAPALFQFDLK

@@ -1,0 +1,291 @@
+---
+title: Make precursor lists
+author: "Jonas D. Förster"
+project:
+    execute-dir: file
+---
+
+# Info
+
+Read in data from *.txt files (one peptide per line, lowercase letters are stable isotope labelled AA, lines starting with # are ignored) in this folder and create precursor tables for availability in other scripts.
+Also creates a suggested peptide list split to avoid precursor isolation overlap in direct infusion experiments where a mix of peptides is used.
+Run !make_optimisations_oe.qmd afterwards if any new data is generated.
+
+# Setup
+
+```{r setup}
+library(conflicted)
+library(here)
+library(JuliaCall)
+Sys.setenv(JULIA_PROJECT = here())
+julia_setup()
+```
+
+```{julia}
+using Revise
+using Underscores: @_
+using DataFrames
+using Peptidomics
+using MSUtils2
+using Printf
+using CSV
+global msu = MSUtils2;
+ENV["COLUMNS"] = 144;
+```
+
+# Settings
+
+```{julia}
+global pre_charge_range = 1:4;
+# The list splitting is too eager if we include copious amounts of precursor charge states, so narrow it down a bit here
+global split_pre_charge_range = 1:3;
+global fixed_mods = [
+    # specify(parse(Peptidomics.Unimod, "Acetyl"), P_AA_N_term, ProtNTerm)
+    specify(parse(Peptidomics.Unimod, "Carbamidomethyl"), P_AA_C)
+];
+global var_mods = [
+    specify(parse(Peptidomics.Unimod, "Oxidation"), P_AA_M)
+];
+```
+
+```{julia}
+# if m/z lower than `mz`, use isolation window `iso_w_mz` m/z.
+global precursor_isolation_rules = [
+    (mz = 400, iso_w_mz = 0.4),
+    (mz = 700, iso_w_mz = 0.7),
+    (mz = 1000, iso_w_mz = 1),
+    (mz = 1500, iso_w_mz = 1.5),
+    (mz = 2000, iso_w_mz = 2),
+    (mz = 2500, iso_w_mz = 3),
+];
+```
+
+
+# Processing
+
+```{julia}
+isdir("peptides") || mkdir("peptides");
+isdir("precursors") || mkdir("precursors");
+```
+
+## Read in peptides
+
+```{julia}
+global peptides_df =
+    @_ readdir() |>
+    filter!(endswith(".txt"), __) |>
+    filter!(!startswith("!"), __) |>
+    map(_[1:(end - 4)], __) |>
+    DataFrame(name = __) |>
+    transform!(__,
+        :name => ByRow() do name
+            out_df = DataFrame(pep_sil = msu.parse_peptide_list(name * ".txt"))
+            out_df.n_pep = 1:nrow(out_df)
+            out_df
+        end => :pep_sil
+    ) |>
+    combine(groupby(__, Not(:pep_sil)), :pep_sil => only => AsTable) |>
+    transform!(__, :pep_sil => ByRow(x -> allvariablemods(applymods(x, fixed_mods), var_mods)) => :pep_mod_sil) |>
+    flatten(__, :pep_mod_sil) |>
+    transform!(__, :pep_mod_sil => ByRow(clearsil) => :pep_mod) |>
+    transform!(__, :pep_mod => ByRow(clearmod) => :pep) |>
+    select(__, :name, :n_pep, :pep_mod_sil, :pep_mod, :pep_sil, :pep, :);
+
+show(peptides_df, truncate = 1)
+```
+
+```{julia}
+global precursors_df =
+    @_ peptides_df |>
+    transform!(__,
+        :pep_mod_sil => ByRow(formula) => :formula_mod_sil,
+        :pep_mod => ByRow(formula) => :formula_mod,
+        :pep_sil => ByRow(formula) => :formula_sil,
+        :pep => ByRow(formula) => :formula,
+    ) |>
+    transform!(__,
+        :formula_mod_sil => ByRow(mass) => :mass_mod_sil,
+        :formula_mod => ByRow(mass) => :mass_mod,
+        :formula_sil => ByRow(mass) => :mass_sil,
+        :formula => ByRow(mass) => :mass,
+    ) |>
+    transform!(__,
+        :pep_mod_sil => ByRow(x -> map(z -> ionize(x, z), pre_charge_range)) => :pre_heavy,
+        :pep_mod => ByRow(x -> map(z -> ionize(x, z), pre_charge_range)) => :pre_light,
+    ) |>
+    flatten(__, [:pre_heavy, :pre_light]) |>
+    transform!(__,
+        :pre_heavy => ByRow(charge) => :pre_charge,
+        :pre_heavy => ByRow(x -> mz(formula(x))) => :mz_heavy,
+        :pre_light => ByRow(x -> mz(formula(x))) => :mz_light,
+    );
+
+show(precursors_df, truncate = 1)
+```
+
+## Generate non-overlapping peptide lists
+
+```{julia}
+# if m/z lower than `mz`, 
+global precursor_isolation_rules = [
+    (mz = 400, iso_w_mz = 0.4),
+    (mz = 700, iso_w_mz = 0.7),
+    (mz = 1000, iso_w_mz = 1),
+    (mz = 1500, iso_w_mz = 1.5),
+    (mz = 2000, iso_w_mz = 2),
+    (mz = 2500, iso_w_mz = 3),
+];
+function get_isolation_window(mz)
+    @assert mz <= 2500
+    i = findfirst(rule -> rule.mz >= mz, precursor_isolation_rules)
+    precursor_isolation_rules[i].iso_w_mz
+end;
+```
+
+```{julia}
+function has_mz_overlap(mz1, mz2)
+    iso_win = (get_isolation_window(mz1) + get_isolation_window(mz2)) / 2
+    abs(mz1 - mz2) < iso_win
+end;
+```
+
+```{julia}
+splitter_df =
+    precursors_df |>
+    df -> groupby(df, :name) |>
+    df -> combine(df) do df
+        # println(keys.name)
+
+        df_for_split = filter(:pre_charge => in(split_pre_charge_range), df)[:, [:pep_sil, :mz_heavy]]
+        sort!(df_for_split, :mz_heavy)
+        split_dfs = [df_for_split]
+        df_template = similar(df_for_split, 0)
+    
+        while true
+            active = false
+            i_df = 1
+            while i_df <= length(split_dfs)
+                curr_df = split_dfs[i_df]
+                for i_row in 2:nrow(curr_df)
+                    if curr_df.pep_sil[i_row - 1] != curr_df.pep_sil[i_row] && has_mz_overlap(curr_df.mz_heavy[i_row - 1], curr_df.mz_heavy[i_row])
+                        active = true
+                        pep_to_move = curr_df.pep_sil[i_row]
+                        length(split_dfs) == i_df && push!(split_dfs, copy(df_template))
+                        next_df = split_dfs[i_df + 1]
+                        filter!(curr_df) do row
+                            row.pep_sil == pep_to_move || return true
+                            push!(next_df, row)
+                            return false
+                        end
+                        sort!(next_df, :mz_heavy)
+                        break
+                    end
+                end
+                i_df += 1
+            end
+            active || break
+        end
+
+        # count_peps = x -> length(unique(x.pep_sil))
+        # println("\tSum: ", sum(count_peps.(split_dfs)))
+        # println("\tPeptides per list: ", count_peps.(split_dfs))
+
+        # evensplit_dfs = map(copy, split_dfs)
+
+        optimal_count = ceil(Int, length(unique(df.pep_sil)) / length(split_dfs))
+        i_df = 1
+        while i_df < length(split_dfs)
+            curr_df = split_dfs[i_df]
+            pep_sil_list = unique(curr_df.pep_sil)
+            curr_df_pep_count = length(pep_sil_list)
+            i_pep = 1
+            while i_pep <= length(pep_sil_list) && curr_df_pep_count > optimal_count
+                pep_to_move = pep_sil_list[i_pep]
+                pep_to_move_mzs = filter(:pep_sil => ==(pep_to_move), curr_df).mz_heavy
+                for next_df in split_dfs[(i_df + 1):end]
+                    mzs_to_dodge = next_df.mz_heavy
+                    any(x -> any(has_mz_overlap.(x, mzs_to_dodge)), pep_to_move_mzs) && continue
+                    
+                    filter!(curr_df) do row
+                        row.pep_sil == pep_to_move || return true
+                        push!(next_df, row)
+                        return false                        
+                    end
+                    curr_df_pep_count -= 1
+                    break
+                end
+                i_pep += 1
+            end
+            i_df += 1
+        end
+
+        # println("\tSum: ", sum(count_peps.(evensplit_dfs)))
+        # println("\tPeptides per list: ", count_peps.(evensplit_dfs))
+    
+        map(enumerate(split_dfs)) do (i, df)
+            df = unique(df, :pep_sil)
+            df[!, :list_number] .= i
+            select!(df, :pep_sil, :list_number)
+        end |>
+        x -> vcat(x...)
+    end;
+```
+
+```{julia}
+println("Writing out peptide lists:")
+@_ peptides_df |>
+    innerjoin(__, splitter_df, on = [:name, :pep_sil], validate = (false, true)) |>
+    groupby(__, :name) |>
+    x -> foreach(pairs(x)) do (keys, df)
+        println("\t", keys.name)
+        df = sort(df, [:n_pep, :list_number])
+        CSV.write("peptides/" * keys.name * ".csv",
+            DataFrame(
+                n = df.n_pep,
+                list_number = df.list_number,
+                seq_mod_sil = string.(df.pep_mod_sil),
+                seq_mod = string.(df.pep_mod),
+                seq_sil = string.(df.pep_sil),
+                seq = string.(df.pep),
+                seq_mod_sil_masses = textrepresentation.(df.pep_mod_sil; modsasmasses = true),
+                seq_mod_masses = textrepresentation.(df.pep_mod; modsasmasses = true),
+                seq_sil_masses = textrepresentation.(df.pep_sil; modsasmasses = true),
+                formula_heavy = formula_to_str.(df.formula_mod_sil),
+                formula_light = formula_to_str.(df.formula_mod),
+                mass_heavy = df.mass_mod_sil,
+                mass_light = df.mass_mod,
+            )
+        )
+    end
+```
+
+```{julia}
+println("Writing out precursor lists:")
+@_ precursors_df |>
+    innerjoin(__, splitter_df, on = [:name, :pep_sil], validate = (false, true)) |>
+    groupby(__, :name) |>
+    x -> foreach(pairs(x)) do (keys, df)
+        println("\t", keys.name)
+        df = sort(df, [:n_pep, :list_number])
+        CSV.write("precursors/" * keys.name * ".csv",
+            DataFrame(
+                n = df.n_pep,
+                list_number = df.list_number,
+                seq_mod_sil = string.(df.pep_mod_sil),
+                seq_mod = string.(df.pep_mod),
+                seq_sil = string.(df.pep_sil),
+                seq = string.(df.pep),
+                seq_mod_sil_masses = textrepresentation.(df.pep_mod_sil; modsasmasses = true),
+                seq_mod_masses = textrepresentation.(df.pep_mod; modsasmasses = true),
+                seq_sil_masses = textrepresentation.(df.pep_sil; modsasmasses = true),
+                formula_heavy = formula_to_str.(df.formula_mod_sil),
+                formula_light = formula_to_str.(df.formula_mod),
+                mass_heavy = df.mass_mod_sil,
+                mass_light = df.mass_mod,
+                pre_charge = df.pre_charge,
+                mz_heavy = df.mz_heavy,
+                mz_light = df.mz_light,
+            )
+        )
+    end
+```

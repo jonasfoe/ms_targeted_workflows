@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<views>
+  <view name="id_all_chromatograms_ms2_top25" rowsource="pwiz.Skyline.Model.Databinding.Entities.Transition" sublist="Results!*" uimode="proteomic">
+    <column name="Results!*.Value.PrecursorResult.PeptideResult.ResultFile.Replicate.Locator" />
+    <column name="Locator" />
+    <column name="Results!*.Value.Chromatogram.RawData.SpectrumIds" />
+    <column name="Results!*.Value.Chromatogram.RawData.Times" />
+    <column name="Results!*.Value.Chromatogram.RawData.Intensities" />
+    <filter column="Results!*.Value.Chromatogram.ChromatogramSource" opname="equals" operand="fragment" />
+    <filter column="Results!*.Value.PeakRankByLevel" opname="&lt;=" operand="25" />
+    <filter column="Results!*.Value.Area" opname="&gt;" operand="0" />
+    <filter column="Results!*.Value.PrecursorResult.BestRetentionTime" opname="" />
+  </view>
+</views>

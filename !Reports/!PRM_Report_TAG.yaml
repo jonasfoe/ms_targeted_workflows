@@ -1,0 +1,39 @@
+## rawfile filename is obligatory, no file extension
+filename: OE2-20211231_001
+## in case the file is not in the local folder, a directory path can be given
+# file_base_path: C:/Rawfiles/
+# ms_date: '2022-12-31'
+# prep_date: '2022-12-31'
+# prep_tag: ABC
+# ip_date: '2022-12-31'
+# ip_tag: ABC
+title: Title
+comments: |
+    comment 1
+
+    comment 2
+# cells: HeLa
+# cell_count: 100e6
+# ab: panHLA class I
+# targets: iRT, HPV
+# detergent: 1% CHAPS
+# ultrafiltered: No
+# desalting: SepPak
+## note the ppm error tolerance used in skyline
+# ppm: 7
+## ppm error tolerance used to extract the MS1 data in the report
+ppm_ms1: 7
+## Amount of SIL peptide spike-in
+# SIL_amount: 0
+## Specify a run that can be considered a baseline for iRT retention times so that the rt shift can be protocolled.
+## Use "pre_run" to use the run prior to (in the skyline file) the run that is reported on.
+rt_reference_filename: pre_run
+## The spectral library folders (single or separated by "," no space). Goes up one level before looking for the folder (../ prepend).
+## Requires skyline chromatogram_raw_lib.csv (!Skyline Templates/chromatogram_raw_lib.skyr) export. Should be the same data that the skyline spectral library is made from
+speclib_dirs: 5 heavy PRM 210605 100min speclib b15 a1
+## specify if any XIC should have specially adjusted plot limits
+plot_dim_overwrites:
+### staying with all default selections would mean setting: NA, NA, NA, NA
+### override any value as desired
+#   PEPTIDEM[+X.XXX]ER++: rt_left, rt_right, i_top, i_bottom
+# the file must end with a final line break ->

@@ -1,0 +1,258 @@
+---
+title: Optimize peptide stable isotope labelling
+author: "Jonas D. Förster"
+project:
+    execute-dir: file
+---
+
+# Info
+
+Check for sequence nesting, where a peptide is present in its full unlabelled sequence within another peptide.
+
+Count m/z collisions (isolation window overlap) between peptides.
+
+# Setup
+
+```{r setup}
+library(conflicted)
+library(here)
+library(JuliaCall)
+Sys.setenv(JULIA_PROJECT = here())
+julia_setup()
+```
+
+```{julia}
+using Revise
+using DataFrames
+using Peptidomics
+using MSUtils2
+using Printf
+using CSV
+global msu = MSUtils2;
+ENV["COLUMNS"] = 144;
+```
+
+# Settings
+
+```{julia}
+# name a .txt file that contains the peptides with the current labelling
+global peplist = "!prepare_peptide_order_peptides";
+
+global pre_charge_range = 1:3;
+global fixed_mods = [
+    # specify(parse(Peptidomics.Unimod, "Acetyl"), P_AA_N_term, ProtNTerm)
+    specify(parse(Peptidomics.Unimod, "Carbamidomethyl"), P_AA_C)
+];
+global var_mods = [
+    specify(parse(Peptidomics.Unimod, "Oxidation"), P_AA_M)
+];
+```
+
+```{julia}
+# if m/z lower than `mz`, use isolation window `iso_w_mz` m/z.
+global precursor_isolation_rules = [
+    (mz = 400, iso_w_mz = 0.4),
+    (mz = 700, iso_w_mz = 0.7),
+    (mz = 1000, iso_w_mz = 1),
+    (mz = 1500, iso_w_mz = 1.5),
+    (mz = 2000, iso_w_mz = 2),
+    (mz = 2500, iso_w_mz = 3),
+];
+```
+
+# Preparation
+
+```{julia}
+function seqlowersil(pep)
+    join(ismissing(pos.label) ? string(pos.aa) : lowercase(string(pos.aa)) for pos in sequence(pep))
+end;
+function find_nesting(seq, seqs_labelled)
+    [(seq, seq_sil) for seq_sil in seqs_labelled if occursin(uppercase(seq), seq_sil)]
+end;
+```
+
+```{julia}
+function get_isolation_window(mz)
+    @assert mz <= 2500
+    i = findfirst(rule -> rule.mz >= mz, precursor_isolation_rules)
+    precursor_isolation_rules[i].iso_w_mz
+end;
+```
+
+```{julia}
+function has_mz_overlap(mz1, mz2)
+    iso_win = (get_isolation_window(mz1) + get_isolation_window(mz2)) / 2
+    abs(mz1 - mz2) < iso_win
+end;
+```
+
+```{julia}
+function make_collisions_0p01mz(df)
+    collision_df = sort(df, :pre_mz)
+    has_collision = [abs(collision_df.pre_mz[i] - collision_df.pre_mz[i + 1]) <= 0.01 for i in 1:(nrow(collision_df) - 1)]
+    i_has_collision = findall(has_collision)
+    i_has_collision = sort(unique(vcat(i_has_collision, i_has_collision .+ 1)))
+    
+    collision_df = collision_df[i_has_collision, :]
+    
+    count = 0
+    collisions = []
+    for row in eachrow(collision_df), row2 in eachrow(collision_df)
+        row.pep_sil == row2.pep_sil && continue
+    
+        if abs(row.pre_mz - row2.pre_mz) <= 0.01
+            count += 1
+            push!(collisions, (row, row2))
+        end
+    end
+    (collisions = collisions, count = count)
+end;
+```
+
+```{julia}
+function make_collisions(df)
+    collision_df = sort(df, :pre_mz)
+    has_collision = [has_mz_overlap(collision_df.pre_mz[i], collision_df.pre_mz[i + 1]) for i in 1:(nrow(collision_df) - 1)]
+    i_has_collision = findall(has_collision)
+    i_has_collision = sort(unique(vcat(i_has_collision, i_has_collision .+ 1)))
+    
+    collision_df = collision_df[i_has_collision, :]
+    
+    count = 0
+    collisions = []
+    for row in eachrow(collision_df), row2 in eachrow(collision_df)
+        row.pep_sil == row2.pep_sil && continue
+    
+        if has_mz_overlap(row.pre_mz, row2.pre_mz)
+            count += 1
+            push!(collisions, (row, row2))
+        end
+    end
+    (collisions = collisions, count = count)
+end;
+```
+
+```{julia}
+function count_split(df)
+    df_for_split = df[:, [:pep_sil, :pre_mz]]
+    sort!(df_for_split, :pre_mz)
+    split_dfs = [df_for_split]
+    df_template = similar(df_for_split, 0)
+
+    while true
+        active = false
+        i_df = 1
+        while i_df <= length(split_dfs)
+            curr_df = split_dfs[i_df]
+            for i_row in 2:nrow(curr_df)
+                if curr_df.pep_sil[i_row - 1] != curr_df.pep_sil[i_row] && has_mz_overlap(curr_df.pre_mz[i_row - 1], curr_df.pre_mz[i_row])
+                    active = true
+                    pep_to_move = curr_df.pep_sil[i_row]
+                    length(split_dfs) == i_df && push!(split_dfs, copy(df_template))
+                    next_df = split_dfs[i_df + 1]
+                    filter!(curr_df) do row
+                        row.pep_sil == pep_to_move || return true
+                        push!(next_df, row)
+                        return false
+                    end
+                    sort!(next_df, :pre_mz)
+                    break
+                end
+            end
+            i_df += 1
+        end
+        active || break
+    end
+
+    length(split_dfs)
+end;
+```
+
+```{julia}
+function add_collision_count(pep_sil, collisions)
+  collisions_relevant = getindex.(filter(x -> x[1].pep_sil == pep_sil, collisions), 2)
+  peptides_count = length(unique(getindex.(collisions_relevant, :pep_sil)))
+  precursors_count = length(unique(getindex.(collisions_relevant, :pre_mod_sil)))
+  (pep_sil = pep_sil, peptides_count = peptides_count, precursors_count = precursors_count)
+end;
+```
+
+```{julia}
+function perform_check()
+  peptides = msu.parse_peptide_list(peplist * ".txt");
+  peptides_lowersil = seqlowersil.(peptides);
+  
+  peptides_df = DataFrame(pep_sil = peptides);
+  peptides_df.n = 1:nrow(peptides_df);
+  
+  peptides_df.pep_mod_sil = map(pep -> allvariablemods(applymods(pep, fixed_mods), var_mods), peptides_df.pep_sil);
+  precursors_df = combine(groupby(peptides_df, Not(:pep_mod_sil)), :pep_mod_sil => only => :pep_mod_sil);
+  
+  precursors_df[!, :pre_charge] .= [pre_charge_range];
+  precursors_df = combine(groupby(precursors_df, Not(:pre_charge)), :pre_charge => only => :pre_charge);
+  
+  precursors_df.pre_mod_sil = ionize.(precursors_df.pep_mod_sil, precursors_df.pre_charge);
+  precursors_df.pre_mz = mz.(precursors_df.pre_mod_sil);
+  
+  seq_nesting_issues = vcat(map(seq -> find_nesting(seq, peptides_lowersil), peptides_lowersil)...);
+  collisions0p01, count0p01 = make_collisions_0p01mz(precursors_df);
+  collisions, count = make_collisions(precursors_df);
+  
+  println("Sequence nesting issues:")
+  if isempty(seq_nesting_issues) println("\tNone") end
+  for (seq_inner, seq_outer) in seq_nesting_issues
+      println("\t", seq_inner, " is nested in ", seq_outer)
+  end
+  
+  println()
+  println()
+  println("≤ 0.01m/z collision count: ", count0p01)
+  println()
+  
+  println("Listing ≤ 0.01m/z collisions (should be prioritized):")
+  for pep_sil in unique(precursors_df.pep_sil)
+      pep_mod_sil_colls = filter(x -> x[1].pep_sil == pep_sil, collisions0p01)
+      length(pep_mod_sil_colls) == 0 && continue
+      
+      println("\t", pep_sil, " has ≤ 0.01m/z collisions: ")
+      for coll in pep_mod_sil_colls
+          coll_mz = abs(mz(coll[1].pre_mod_sil) - mz(coll[2].pre_mod_sil))
+          println("\t\t", coll[1].pre_mod_sil, " : ", coll[2].pre_mod_sil)
+      end
+  end
+  
+  println()
+  println()
+  println("Isolation m/z collision count: ", count)
+  println("List split count to achieve 0 collisions: ", count_split(precursors_df))
+  println()
+  
+  println("Listing isolation m/z collisions:")
+  precursors_df.pep_sil |>
+    unique |>
+    x -> map(y -> add_collision_count(y, collisions), x) |>
+    x -> sort(x, by = y -> getindex(y, [:peptides_count, :precursors_count]), rev = true) |>
+    x -> foreach(x) do (pep_sil, peptides_count, precursors_count)
+      pep_mod_sil_colls = filter(x -> x[1].pep_sil == pep_sil, collisions)
+      length(pep_mod_sil_colls) == 0 && return
+  
+      sort!(pep_mod_sil_colls, by = x -> string(sequence(x[2].pep_mod_sil)))
+      println("\t", pep_sil, " has collisions with ", peptides_count, " peptides and ", precursors_count, " precursors: ")
+      for coll in pep_mod_sil_colls
+          coll_mz = abs(mz(coll[1].pre_mod_sil) - mz(coll[2].pre_mod_sil))
+          println("\t\t", coll[1].pre_mod_sil, repeat(' ', maximum(pre_charge_range) - charge(coll[1].pre_mod_sil)), " : ", coll[2].pre_mod_sil, " at Δm/z ", round(coll_mz, digits = 1))
+      end
+    end
+end;
+```
+
+# Evaluation
+
+Read in and perform checks.
+Play with labelling in .txt file and reevaluate only this chunk / function.
+The output here is information on potential issues with the labelling.
+Closely similar precursor m/z values, leading to potential coisolation in the same isolation window, are referred to here as collisions.
+
+```{julia}
+perform_check()
+```

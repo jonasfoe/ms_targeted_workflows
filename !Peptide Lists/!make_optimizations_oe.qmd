@@ -1,0 +1,101 @@
+---
+title: Compile peptide optimisation lists
+author: "Jonas D. Förster"
+project:
+    execute-dir: file
+---
+
+# Info
+
+When new optimization data is created, it has to be checked for consistency and submitted into all the optimization files.
+When new optimization data is meant to be read in, this is done in the form of a .csv file. For templates, use the files in optimized_oe/. Readin .csv files are put in optimized_oe/readin/ and will be integrated when running this script.
+Also execute this whenever new precursors are added to the workflow (new peptides in !Peptide Lists/)
+
+A backup of all the prior data will be put into optimized_oe/bkp.
+
+In case of inconsistencies, errors will be generated. To recover, fix errors manually or consider deleting all data but !all_peptides.csv to ensure that there will be a single ground truth.
+
+# Setup
+
+```{r setup}
+# code is outsourced to speed up interactive use of this file
+source("!make_optimizations_oe_code.R")
+eval(code$setup)
+```
+
+# Settings
+
+```{r}
+# any table in the "/readin" folder will be processed and integrated into the master list.
+# By default, empty fields will not overwrite existing data in the master list.
+# Set to TRUE to force overwriting all existing data according to what is in the readin table.
+# Precursor data for precursors or full columns that don't exist in any readin tables are unaffected.
+readin_force_overwrite <- FALSE
+```
+
+```{r}
+# Set to true to overwrite all info with data from the master file !all_peptides.csv
+only_use_all_peptide_table <- FALSE
+```
+
+```{r}
+# the location of the optimizations folder
+opt_folder <- "optimized_oe"
+```
+
+# Processing
+
+```{r}
+# Read in precursor master list to be able to ensure information on which precursors need to be in the database is available
+# New precursors might have to be integrated
+# Old precursors might have been deleted
+eval(code$readin_precursors)
+
+# precursors_df
+```
+
+```{r}
+# Read in all optimization data
+# All columns are verified for integrity upon readin
+eval(code$readin_optimizations)
+
+# opt_data_df
+```
+
+```{r}
+# Extensive validation of all existing data is performed to ensure that everything is consistent between all tables
+# A consolidated table then has each precursor only once
+eval(code$consolidate_optimizations)
+
+# opt_data_consolidated_df
+```
+
+```{r}
+# List homeless precursors
+# These are precursors for which optimization data is present, but which are for unknown reasons not in the precursor master list anymore.
+eval(code$list_homeless_precursors)
+```
+
+```{r}
+# Read all tables in the /readin folder and validate the data
+# All new data is then integrated into the main optimization database
+eval(code$integrate_readin_data)
+
+# walk(readin_df_list, print)
+# opt_data_consolidated_df
+```
+
+```{r}
+eval(code$expand_for_write_out)
+
+# opt_data_new_df
+```
+
+```{r}
+eval(code$write_out_backup)
+eval(code$write_out_data)
+```
+
+```{r include=FALSE}
+cat0("Finished: ", date(), "\n")
+```
